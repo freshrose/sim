@@ -8,25 +8,6 @@ import { BlockInfoCard } from "@/components/ui/block-info-card"
 <BlockInfoCard 
   type="google_sheets"
   color="#E0E0E0"
-  icon={true}
-  iconSvg={`<svg className="block-icon"
-      
-      xmlns='http://www.w3.org/2000/svg'
-      viewBox='0 0 48 48'
-      
-      
-    >
-      <path
-        fill='#43a047'
-        d='M37,45H11c-1.657,0-3-1.343-3-3V6c0-1.657,1.343-3,3-3h19l10,10v29C40,43.657,38.657,45,37,45z'
-      />
-      <path fill='#c8e6c9' d='M40 13L30 13 30 3z' />
-      <path fill='#2e7d32' d='M30 13L40 23 40 13z' />
-      <path
-        fill='#e8f5e9'
-        d='M31,23H17h-2v2v2v2v2v2v2v2h18v-2v-2v-2v-2v-2v-2v-2H31z M17,25h4v2h-4V25z M17,29h4v2h-4V29z M17,33h4v2h-4V33z M31,35h-8v-2h8V35z M31,31h-8v-2h8V31z M31,27h-8v-2h8V27z'
-      />
-    </svg>`}
 />
 
 {/* MANUAL-CONTENT-START:intro */}
@@ -110,8 +91,8 @@ Read data from a Google Sheets spreadsheet
 
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
-| `spreadsheetId` | string | Yes | The ID of the spreadsheet to read from |
-| `range` | string | No | The range of cells to read from |
+| `spreadsheetId` | string | Yes | The ID of the spreadsheet \(found in the URL: docs.google.com/spreadsheets/d/\{SPREADSHEET_ID\}/edit\). |
+| `range` | string | No | The A1 notation range to read \(e.g. "Sheet1!A1:D10", "A1:B5"\). Defaults to first sheet A1:Z1000 if not specified. |
 
 #### Output
 
@@ -128,9 +109,9 @@ Write data to a Google Sheets spreadsheet
 
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
-| `spreadsheetId` | string | Yes | The ID of the spreadsheet to write to |
-| `range` | string | No | The range of cells to write to |
-| `values` | array | Yes | The data to write to the spreadsheet |
+| `spreadsheetId` | string | Yes | The ID of the spreadsheet |
+| `range` | string | No | The A1 notation range to write to \(e.g. "Sheet1!A1:D10", "A1:B5"\) |
+| `values` | array | Yes | The data to write as a 2D array \(e.g. \[\["Name", "Age"\], \["Alice", 30\], \["Bob", 25\]\]\) or array of objects. |
 | `valueInputOption` | string | No | The format of the data to write |
 | `includeValuesInResponse` | boolean | No | Whether to include the written values in the response |
 
@@ -153,8 +134,8 @@ Update data in a Google Sheets spreadsheet
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
 | `spreadsheetId` | string | Yes | The ID of the spreadsheet to update |
-| `range` | string | No | The range of cells to update |
-| `values` | array | Yes | The data to update in the spreadsheet |
+| `range` | string | No | The A1 notation range to update \(e.g. "Sheet1!A1:D10", "A1:B5"\) |
+| `values` | array | Yes | The data to update as a 2D array \(e.g. \[\["Name", "Age"\], \["Alice", 30\]\]\) or array of objects. |
 | `valueInputOption` | string | No | The format of the data to update |
 | `includeValuesInResponse` | boolean | No | Whether to include the updated values in the response |
 
@@ -177,8 +158,8 @@ Append data to the end of a Google Sheets spreadsheet
 | Parameter | Type | Required | Description |
 | --------- | ---- | -------- | ----------- |
 | `spreadsheetId` | string | Yes | The ID of the spreadsheet to append to |
-| `range` | string | No | The range of cells to append after |
-| `values` | array | Yes | The data to append to the spreadsheet |
+| `range` | string | No | The A1 notation range to append after \(e.g. "Sheet1", "Sheet1!A:D"\) |
+| `values` | array | Yes | The data to append as a 2D array \(e.g. \[\["Alice", 30\], \["Bob", 25\]\]\) or array of objects. |
 | `valueInputOption` | string | No | The format of the data to append |
 | `insertDataOption` | string | No | How to insert the data \(OVERWRITE or INSERT_ROWS\) |
 | `includeValuesInResponse` | boolean | No | Whether to include the appended values in the response |

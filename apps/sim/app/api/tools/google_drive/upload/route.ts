@@ -1,9 +1,10 @@
 import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { checkHybridAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
 import { createLogger } from '@/lib/logs/console/logger'
-import { downloadFileFromStorage, processSingleFileToUserFile } from '@/lib/uploads/file-processing'
-import { generateRequestId } from '@/lib/utils'
+import { processSingleFileToUserFile } from '@/lib/uploads/utils/file-utils'
+import { downloadFileFromStorage } from '@/lib/uploads/utils/file-utils.server'
 import {
   GOOGLE_WORKSPACE_MIME_TYPES,
   handleSheetsFormat,

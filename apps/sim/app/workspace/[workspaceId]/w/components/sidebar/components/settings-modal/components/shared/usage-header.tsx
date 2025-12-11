@@ -1,8 +1,9 @@
 'use client'
 
 import type { ReactNode } from 'react'
-import { Badge, Progress } from '@/components/ui'
-import { cn } from '@/lib/utils'
+import { Badge } from '@/components/emcn'
+import { calculateFilledPills, USAGE_PILL_COUNT } from '@/lib/billing/client/usage-visualization'
+import { cn } from '@/lib/core/utils/cn'
 
 const GRADIENT_BADGE_STYLES =
   'gradient-text h-[1.125rem] rounded-[6px] border-gradient-primary/20 bg-gradient-to-b from-gradient-primary via-gradient-secondary to-gradient-primary px-2 py-0 font-medium text-xs cursor-pointer'
@@ -19,7 +20,10 @@ interface UsageHeaderProps {
   progressValue?: number
   seatsText?: string
   isBlocked?: boolean
+  blockedReason?: 'payment_failed' | 'dispute' | null
+  blockedByOrgOwner?: boolean
   onResolvePayment?: () => void
+  onContactSupport?: () => void
   status?: 'ok' | 'warning' | 'exceeded' | 'blocked'
   percentUsed?: number
 }
@@ -36,23 +40,31 @@ export function UsageHeader({
   progressValue,
   seatsText,
   isBlocked,
+  blockedReason,
+  blockedByOrgOwner,
   onResolvePayment,
+  onContactSupport,
   status,
   percentUsed,
 }: UsageHeaderProps) {
   const progress = progressValue ?? (limit > 0 ? Math.min((current / limit) * 100, 100) : 0)
 
+  // Calculate filled pills based on usage percentage using shared utility (fixed 8 pills)
+  const filledPillsCount = calculateFilledPills(progress)
+  const isAlmostOut = filledPillsCount === USAGE_PILL_COUNT
+
   return (
     <div className='rounded-[8px] border bg-background p-3 shadow-xs'>
       <div className='space-y-2'>
+        {/* Top row */}
         <div className='flex items-center justify-between'>
           <div className='flex items-center gap-2'>
             <span
               className={cn(
-                'font-medium text-sm',
+                'font-medium text-[12px]',
                 gradientTitle
                   ? 'gradient-text bg-gradient-to-b from-gradient-primary via-gradient-secondary to-gradient-primary'
-                  : 'text-foreground'
+                  : 'text-[#FFFFFF]'
               )}
             >
               {title}
@@ -66,26 +78,66 @@ export function UsageHeader({
               <span className='text-muted-foreground text-xs'>({seatsText})</span>
             ) : null}
           </div>
-          <div className='flex items-center gap-1 text-xs tabular-nums'>
+          <div className='flex items-center gap-[4px] text-xs tabular-nums'>
             {isBlocked ? (
-              <span className='text-muted-foreground'>Payment required</span>
+              <span className='font-medium text-[12px] text-[var(--text-secondary)]'>
+                Payment required
+              </span>
             ) : (
               <>
-                <span className='text-muted-foreground'>${current.toFixed(2)}</span>
-                <span className='text-muted-foreground'>/</span>
-                {rightContent ?? <span className='text-muted-foreground'>${limit}</span>}
+                <span className='font-medium text-[12px] text-[var(--text-secondary)] tabular-nums'>
+                  ${current.toFixed(2)}
+                </span>
+                <span className='font-medium text-[12px] text-[var(--text-secondary)]'>/</span>
+                {rightContent ?? (
+                  <span className='font-medium text-[12px] text-[var(--text-secondary)] tabular-nums'>
+                    ${limit}
+                  </span>
+                )}
               </>
             )}
           </div>
         </div>
 
-        <Progress
-          value={isBlocked ? 100 : progress}
-          className='h-2'
-          indicatorClassName='bg-black dark:bg-white'
-        />
+        {/* Pills row - fixed 8 pills with shared heuristic */}
+        <div className='flex items-center gap-[4px]'>
+          {Array.from({ length: USAGE_PILL_COUNT }).map((_, i) => {
+            const isFilled = i < filledPillsCount
+            return (
+              <div
+                key={i}
+                className='h-[6px] flex-1 rounded-[2px]'
+                style={{
+                  backgroundColor: isFilled
+                    ? isAlmostOut
+                      ? 'var(--text-error)'
+                      : '#34B5FF'
+                    : '#414141',
+                }}
+              />
+            )
+          })}
+        </div>
 
-        {isBlocked && (
+        {/* Status messages */}
+        {isBlocked && blockedReason === 'dispute' && (
+          <div className='flex items-center justify-between rounded-[6px] bg-destructive/10 px-2 py-1'>
+            <span className='text-destructive text-xs'>
+              Account frozen. Please contact support to resolve this issue.
+            </span>
+            {onContactSupport && (
+              <button
+                type='button'
+                className='font-medium text-destructive text-xs underline underline-offset-2'
+                onClick={onContactSupport}
+              >
+                Get help
+              </button>
+            )}
+          </div>
+        )}
+
+        {isBlocked && blockedReason !== 'dispute' && !blockedByOrgOwner && (
           <div className='flex items-center justify-between rounded-[6px] bg-destructive/10 px-2 py-1'>
             <span className='text-destructive text-xs'>
               Payment failed. Please update your payment method.
@@ -99,6 +151,22 @@ export function UsageHeader({
                 Resolve payment
               </button>
             )}
+          </div>
+        )}
+
+        {isBlocked && blockedByOrgOwner && blockedReason !== 'dispute' && (
+          <div className='rounded-[6px] bg-destructive/10 px-2 py-1'>
+            <span className='text-destructive text-xs'>
+              Organization billing issue. Please contact your organization owner.
+            </span>
+          </div>
+        )}
+
+        {isBlocked && blockedByOrgOwner && blockedReason === 'dispute' && (
+          <div className='rounded-[6px] bg-destructive/10 px-2 py-1'>
+            <span className='text-destructive text-xs'>
+              Organization account frozen. Please contact support.
+            </span>
           </div>
         )}
 

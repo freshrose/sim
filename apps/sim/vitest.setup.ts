@@ -57,6 +57,15 @@ vi.mock('@/stores/console/store', () => ({
   },
 }))
 
+vi.mock('@/stores/terminal', () => ({
+  useTerminalConsoleStore: {
+    getState: vi.fn().mockReturnValue({
+      addConsole: vi.fn(),
+      updateConsole: vi.fn(),
+    }),
+  },
+}))
+
 vi.mock('@/stores/execution/store', () => ({
   useExecutionStore: {
     getState: vi.fn().mockReturnValue({
@@ -78,6 +87,18 @@ vi.mock('@/blocks/registry', () => ({
     outputs: {},
   })),
   getAllBlocks: vi.fn(() => ({})),
+}))
+
+vi.mock('@trigger.dev/sdk', () => ({
+  task: vi.fn(() => ({ trigger: vi.fn() })),
+  tasks: {
+    trigger: vi.fn().mockResolvedValue({ id: 'mock-task-id' }),
+    batchTrigger: vi.fn().mockResolvedValue([{ id: 'mock-task-id' }]),
+  },
+  runs: {
+    retrieve: vi.fn().mockResolvedValue({ id: 'mock-run-id', status: 'COMPLETED' }),
+  },
+  configure: vi.fn(),
 }))
 
 const originalConsoleError = console.error

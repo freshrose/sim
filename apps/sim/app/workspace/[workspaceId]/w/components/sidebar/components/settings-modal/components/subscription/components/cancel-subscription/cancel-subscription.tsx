@@ -1,24 +1,15 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
-import { Button } from '@/components/ui/button'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { useSession, useSubscription } from '@/lib/auth-client'
+import { useQueryClient } from '@tanstack/react-query'
+import { Button, Modal, ModalBody, ModalContent, ModalFooter, ModalHeader } from '@/components/emcn'
+import { useSession, useSubscription } from '@/lib/auth/auth-client'
+import { getSubscriptionStatus } from '@/lib/billing/client/utils'
+import { cn } from '@/lib/core/utils/cn'
+import { getBaseUrl } from '@/lib/core/utils/urls'
 import { createLogger } from '@/lib/logs/console/logger'
-import { getBaseUrl } from '@/lib/urls/utils'
-import { cn } from '@/lib/utils'
-import { useOrganizationStore } from '@/stores/organization'
-import { useSubscriptionStore } from '@/stores/subscription/store'
+import { organizationKeys, useOrganizations } from '@/hooks/queries/organization'
+import { subscriptionKeys, useSubscriptionData } from '@/hooks/queries/subscription'
 
 const logger = createLogger('CancelSubscription')
 
@@ -30,6 +21,7 @@ interface CancelSubscriptionProps {
   }
   subscriptionData?: {
     periodEnd?: Date | null
+    cancelAtPeriodEnd?: boolean
   }
 }
 
@@ -40,9 +32,11 @@ export function CancelSubscription({ subscription, subscriptionData }: CancelSub
 
   const { data: session } = useSession()
   const betterAuthSubscription = useSubscription()
-  const { activeOrganization, loadOrganizationSubscription, refreshOrganization } =
-    useOrganizationStore()
-  const { getSubscriptionStatus, refresh } = useSubscriptionStore()
+  const { data: orgsData } = useOrganizations()
+  const { data: subData } = useSubscriptionData()
+  const queryClient = useQueryClient()
+  const activeOrganization = orgsData?.activeOrganization
+  const currentSubscriptionStatus = getSubscriptionStatus(subData?.data)
 
   // Clear error after 3 seconds
   useEffect(() => {
@@ -66,7 +60,7 @@ export function CancelSubscription({ subscription, subscriptionData }: CancelSub
     setError(null)
 
     try {
-      const subscriptionStatus = getSubscriptionStatus()
+      const subscriptionStatus = currentSubscriptionStatus
       const activeOrgId = activeOrganization?.id
 
       let referenceId = session.user.id
@@ -75,8 +69,7 @@ export function CancelSubscription({ subscription, subscriptionData }: CancelSub
       if (subscriptionStatus.isTeam && activeOrgId) {
         referenceId = activeOrgId
         // Get subscription ID for team/enterprise
-        const orgSubscription = useOrganizationStore.getState().subscriptionData
-        subscriptionId = orgSubscription?.id
+        subscriptionId = subData?.data?.id
       }
 
       logger.info('Canceling subscription', {
@@ -124,38 +117,52 @@ export function CancelSubscription({ subscription, subscriptionData }: CancelSub
     setError(null)
 
     try {
-      const subscriptionStatus = getSubscriptionStatus()
+      const subscriptionStatus = currentSubscriptionStatus
       const activeOrgId = activeOrganization?.id
 
-      // For team/enterprise plans, get the subscription ID from organization store
-      if ((subscriptionStatus.isTeam || subscriptionStatus.isEnterprise) && activeOrgId) {
-        const orgSubscription = useOrganizationStore.getState().subscriptionData
-
-        if (orgSubscription?.id && orgSubscription?.cancelAtPeriodEnd) {
-          // Restore the organization subscription
-          if (!betterAuthSubscription.restore) {
-            throw new Error('Subscription restore not available')
-          }
-
-          const result = await betterAuthSubscription.restore({
-            referenceId: activeOrgId,
-            subscriptionId: orgSubscription.id,
-          })
-          logger.info('Organization subscription restored successfully', result)
+      if (isCancelAtPeriodEnd) {
+        if (!betterAuthSubscription.restore) {
+          throw new Error('Subscription restore not available')
         }
+
+        let referenceId: string
+        let subscriptionId: string | undefined
+
+        if ((subscriptionStatus.isTeam || subscriptionStatus.isEnterprise) && activeOrgId) {
+          referenceId = activeOrgId
+          subscriptionId = subData?.data?.id
+        } else {
+          // For personal subscriptions, use user ID and let better-auth find the subscription
+          referenceId = session.user.id
+          subscriptionId = undefined
+        }
+
+        logger.info('Restoring subscription', { referenceId, subscriptionId })
+
+        // Build restore params - only include subscriptionId if we have one (team/enterprise)
+        const restoreParams: any = { referenceId }
+        if (subscriptionId) {
+          restoreParams.subscriptionId = subscriptionId
+        }
+
+        const result = await betterAuthSubscription.restore(restoreParams)
+
+        logger.info('Subscription restored successfully', result)
       }
 
-      // Refresh state and close
-      await refresh()
+      // Invalidate queries to refresh data
+      await queryClient.invalidateQueries({ queryKey: subscriptionKeys.user() })
       if (activeOrgId) {
-        await loadOrganizationSubscription(activeOrgId)
-        await refreshOrganization().catch(() => {})
+        await queryClient.invalidateQueries({ queryKey: organizationKeys.detail(activeOrgId) })
+        await queryClient.invalidateQueries({ queryKey: organizationKeys.billing(activeOrgId) })
+        await queryClient.invalidateQueries({ queryKey: organizationKeys.lists() })
       }
+
       setIsDialogOpen(false)
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to keep subscription'
+      const errorMessage = error instanceof Error ? error.message : 'Failed to restore subscription'
       setError(errorMessage)
-      logger.error('Failed to keep subscription', { error })
+      logger.error('Failed to restore subscription', { error })
     } finally {
       setIsLoading(false)
     }
@@ -190,21 +197,17 @@ export function CancelSubscription({ subscription, subscriptionData }: CancelSub
   const periodEndDate = getPeriodEndDate()
 
   // Check if subscription is set to cancel at period end
-  const isCancelAtPeriodEnd = (() => {
-    const subscriptionStatus = getSubscriptionStatus()
-    if (subscriptionStatus.isTeam || subscriptionStatus.isEnterprise) {
-      return useOrganizationStore.getState().subscriptionData?.cancelAtPeriodEnd === true
-    }
-    return false
-  })()
+  const isCancelAtPeriodEnd = subscriptionData?.cancelAtPeriodEnd === true
 
   return (
     <>
       <div className='flex items-center justify-between'>
         <div>
-          <span className='font-medium text-sm'>Manage Subscription</span>
+          <span className='font-medium text-[13px]'>
+            {isCancelAtPeriodEnd ? 'Restore Subscription' : 'Manage Subscription'}
+          </span>
           {isCancelAtPeriodEnd && (
-            <p className='mt-1 text-muted-foreground text-xs'>
+            <p className='mt-1 text-[var(--text-muted)] text-xs'>
               You'll keep access until {formatDate(periodEndDate)}
             </p>
           )}
@@ -214,99 +217,79 @@ export function CancelSubscription({ subscription, subscriptionData }: CancelSub
           onClick={() => setIsDialogOpen(true)}
           disabled={isLoading}
           className={cn(
-            'h-8 rounded-[8px] font-medium text-xs transition-all duration-200',
-            error
-              ? 'border-red-500 text-red-500 dark:border-red-500 dark:text-red-500'
-              : 'text-muted-foreground hover:border-red-500 hover:bg-red-500 hover:text-white dark:hover:border-red-500 dark:hover:bg-red-500'
+            'h-8 rounded-[8px] font-medium text-xs',
+            error && 'border-[var(--text-error)] text-[var(--text-error)]'
           )}
         >
-          {error ? 'Error' : 'Manage'}
+          {error ? 'Error' : isCancelAtPeriodEnd ? 'Restore' : 'Manage'}
         </Button>
       </div>
 
-      <AlertDialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {isCancelAtPeriodEnd ? 'Manage' : 'Cancel'} {subscription.plan} subscription?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
+      <Modal open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+        <ModalContent className='w-[400px]'>
+          <ModalHeader>
+            {isCancelAtPeriodEnd ? 'Restore' : 'Cancel'} {subscription.plan} Subscription
+          </ModalHeader>
+          <ModalBody>
+            <p className='text-[12px] text-[var(--text-tertiary)]'>
               {isCancelAtPeriodEnd
-                ? 'Your subscription is set to cancel at the end of the billing period. You can reactivate it or manage other settings.'
+                ? 'Your subscription is set to cancel at the end of the billing period. Would you like to keep your subscription active?'
                 : `You'll be redirected to Stripe to manage your subscription. You'll keep access until ${formatDate(
                     periodEndDate
                   )}, then downgrade to free plan.`}{' '}
               {!isCancelAtPeriodEnd && (
-                <span className='text-red-500 dark:text-red-500'>
-                  This action cannot be undone.
-                </span>
+                <span className='text-[var(--text-error)]'>This action cannot be undone.</span>
               )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
+            </p>
 
-          {!isCancelAtPeriodEnd && (
-            <div className='py-2'>
-              <div className='rounded-[8px] bg-muted/50 p-3 text-sm'>
-                <ul className='space-y-1 text-muted-foreground text-xs'>
-                  <li>• Keep all features until {formatDate(periodEndDate)}</li>
-                  <li>• No more charges</li>
-                  <li>• Data preserved</li>
-                  <li>• Can reactivate anytime</li>
-                </ul>
+            {!isCancelAtPeriodEnd && (
+              <div className='mt-3'>
+                <div className='rounded-[8px] bg-[var(--surface-3)] p-3 text-sm'>
+                  <ul className='space-y-1 text-[var(--text-muted)] text-xs'>
+                    <li>• Keep all features until {formatDate(periodEndDate)}</li>
+                    <li>• No more charges</li>
+                    <li>• Data preserved</li>
+                    <li>• Can reactivate anytime</li>
+                  </ul>
+                </div>
               </div>
-            </div>
-          )}
-
-          <AlertDialogFooter className='flex'>
-            <AlertDialogCancel
-              className='h-9 w-full rounded-[8px]'
-              onClick={handleKeep}
+            )}
+          </ModalBody>
+          <ModalFooter>
+            <Button
+              variant='active'
+              onClick={isCancelAtPeriodEnd ? () => setIsDialogOpen(false) : handleKeep}
               disabled={isLoading}
             >
-              Keep Subscription
-            </AlertDialogCancel>
+              {isCancelAtPeriodEnd ? 'Cancel' : 'Keep Subscription'}
+            </Button>
 
             {(() => {
-              const subscriptionStatus = getSubscriptionStatus()
-              if (
-                subscriptionStatus.isPaid &&
-                (activeOrganization?.id
-                  ? useOrganizationStore.getState().subscriptionData?.cancelAtPeriodEnd
-                  : false)
-              ) {
+              const subscriptionStatus = currentSubscriptionStatus
+              if (subscriptionStatus.isPaid && isCancelAtPeriodEnd) {
                 return (
-                  <TooltipProvider delayDuration={0}>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <div className='w-full'>
-                          <AlertDialogAction
-                            disabled
-                            className='h-9 w-full cursor-not-allowed rounded-[8px] bg-muted text-muted-foreground opacity-50'
-                          >
-                            Continue
-                          </AlertDialogAction>
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent side='top'>
-                        <p>Subscription will be cancelled at end of billing period</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
+                  <Button
+                    onClick={handleKeep}
+                    className='h-[32px] bg-green-500 px-[12px] text-white hover:bg-green-600 dark:bg-green-500 dark:hover:bg-green-600'
+                    disabled={isLoading}
+                  >
+                    {isLoading ? 'Restoring...' : 'Restore Subscription'}
+                  </Button>
                 )
               }
               return (
-                <AlertDialogAction
+                <Button
                   onClick={handleCancel}
-                  className='h-9 w-full rounded-[8px] bg-red-500 text-white transition-all duration-200 hover:bg-red-600 dark:bg-red-500 dark:hover:bg-red-600'
+                  className='h-[32px] bg-[var(--text-error)] px-[12px] text-[var(--white)] hover:bg-[var(--text-error)] hover:text-[var(--white)] dark:bg-[var(--text-error)] dark:text-[var(--white)] hover:dark:bg-[var(--text-error)] dark:hover:text-[var(--white)]'
                   disabled={isLoading}
                 >
                   {isLoading ? 'Redirecting...' : 'Continue'}
-                </AlertDialogAction>
+                </Button>
               )
             })()}
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
     </>
   )
 }

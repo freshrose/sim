@@ -1,39 +1,41 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { Loader2 } from 'lucide-react'
 import { useParams, useRouter } from 'next/navigation'
-import { LoadingAgent } from '@/components/ui/loading-agent'
+import { createLogger } from '@/lib/logs/console/logger'
+import { useWorkflows } from '@/hooks/queries/workflows'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
+
+const logger = createLogger('WorkflowsPage')
 
 export default function WorkflowsPage() {
   const router = useRouter()
-  const { workflows, isLoading, loadWorkflows, setActiveWorkflow } = useWorkflowRegistry()
-  const [hasInitialized, setHasInitialized] = useState(false)
-
+  const { workflows, setActiveWorkflow } = useWorkflowRegistry()
   const params = useParams()
   const workspaceId = params.workspaceId as string
+  const [isMounted, setIsMounted] = useState(false)
 
-  // Initialize workspace workflows
+  // Fetch workflows using React Query
+  const { isLoading, isError } = useWorkflows(workspaceId)
+
+  // Track when component is mounted to avoid hydration issues
   useEffect(() => {
-    const initializeWorkspace = async () => {
-      try {
-        await loadWorkflows(workspaceId)
-        setHasInitialized(true)
-      } catch (error) {
-        console.error('Failed to load workflows for workspace:', error)
-        setHasInitialized(true) // Still mark as initialized to show error state
-      }
-    }
+    setIsMounted(true)
+  }, [])
 
-    if (!hasInitialized) {
-      initializeWorkspace()
-    }
-  }, [workspaceId, loadWorkflows, hasInitialized])
-
-  // Handle redirection once workflows are loaded
+  // Handle redirection once workflows are loaded and component is mounted
   useEffect(() => {
-    // Only proceed if we've initialized and workflows are not loading
-    if (!hasInitialized || isLoading) return
+    // Wait for component to be mounted to avoid hydration mismatches
+    if (!isMounted) return
+
+    // Only proceed if workflows are done loading
+    if (isLoading) return
+
+    if (isError) {
+      logger.error('Failed to load workflows for workspace')
+      return
+    }
 
     const workflowIds = Object.keys(workflows)
 
@@ -45,24 +47,22 @@ export default function WorkflowsPage() {
 
     // If we have valid workspace workflows, redirect to the first one
     if (workspaceWorkflows.length > 0) {
-      // Ensure the workflow is set as active before redirecting
-      // This prevents the empty canvas issue on first login
       const firstWorkflowId = workspaceWorkflows[0]
-      setActiveWorkflow(firstWorkflowId).then(() => {
-        router.replace(`/workspace/${workspaceId}/w/${firstWorkflowId}`)
-      })
+      router.replace(`/workspace/${workspaceId}/w/${firstWorkflowId}`)
     }
-  }, [hasInitialized, isLoading, workflows, workspaceId, router, setActiveWorkflow])
+  }, [isMounted, isLoading, workflows, workspaceId, router, setActiveWorkflow, isError])
 
   // Always show loading state until redirect happens
   // There should always be a default workflow, so we never show "no workflows found"
   return (
-    <div className='flex h-screen items-center justify-center'>
-      <div className='text-center'>
-        <div className='mx-auto mb-4'>
-          <LoadingAgent size='lg' />
+    <main className='flex h-full flex-1 flex-col overflow-hidden bg-muted/40'>
+      <div className='flex h-full items-center justify-center'>
+        <div className='text-center'>
+          <div className='mx-auto mb-4'>
+            <Loader2 className='h-5 w-5 animate-spin text-muted-foreground' />
+          </div>
         </div>
       </div>
-    </div>
+    </main>
   )
 }

@@ -6,7 +6,7 @@ import {
   getSlotsForFieldType,
   SUPPORTED_FIELD_TYPES,
   type TAG_SLOT_CONFIG,
-} from '@/lib/knowledge/consts'
+} from '@/lib/knowledge/constants'
 import type { BulkTagDefinitionsData, DocumentTagDefinition } from '@/lib/knowledge/tags/types'
 import type {
   CreateTagDefinitionData,
@@ -573,7 +573,8 @@ export async function getTagUsage(
         and(
           eq(document.knowledgeBaseId, knowledgeBaseId),
           isNull(document.deletedAt),
-          isNotNull(sql`${sql.raw(tagSlot)}`)
+          isNotNull(sql`${sql.raw(tagSlot)}`),
+          sql`${sql.raw(tagSlot)} != ''`
         )
       )
 

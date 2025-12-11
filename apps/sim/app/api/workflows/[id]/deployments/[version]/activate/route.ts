@@ -1,8 +1,8 @@
 import { db, workflow, workflowDeploymentVersion } from '@sim/db'
 import { and, eq } from 'drizzle-orm'
 import type { NextRequest } from 'next/server'
+import { generateRequestId } from '@/lib/core/utils/request'
 import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
 import { validateWorkflowPermissions } from '@/lib/workflows/utils'
 import { createErrorResponse, createSuccessResponse } from '@/app/api/workflows/utils'
 
@@ -57,10 +57,12 @@ export async function POST(
         throw new Error('Deployment version not found')
       }
 
-      await tx
-        .update(workflow)
-        .set({ isDeployed: true, deployedAt: now })
-        .where(eq(workflow.id, id))
+      const updateData: Record<string, unknown> = {
+        isDeployed: true,
+        deployedAt: now,
+      }
+
+      await tx.update(workflow).set(updateData).where(eq(workflow.id, id))
     })
 
     return createSuccessResponse({ success: true, deployedAt: now })

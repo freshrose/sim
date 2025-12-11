@@ -1,7 +1,7 @@
 import type { NextConfig } from 'next'
-import { env, getEnv, isTruthy } from './lib/env'
-import { isDev, isHosted } from './lib/environment'
-import { getMainCSPPolicy, getWorkflowExecutionCSPPolicy } from './lib/security/csp'
+import { env, getEnv, isTruthy } from './lib/core/config/env'
+import { isDev, isHosted } from './lib/core/config/environment'
+import { getMainCSPPolicy, getWorkflowExecutionCSPPolicy } from './lib/core/security/csp'
 
 const nextConfig: NextConfig = {
   devIndicators: false,
@@ -68,17 +68,22 @@ const nextConfig: NextConfig = {
   typescript: {
     ignoreBuildErrors: isTruthy(env.DOCKER_BUILD),
   },
-  eslint: {
-    ignoreDuringBuilds: isTruthy(env.DOCKER_BUILD),
-  },
   output: isTruthy(env.DOCKER_BUILD) ? 'standalone' : undefined,
   turbopack: {
     resolveExtensions: ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.json'],
   },
-  serverExternalPackages: ['pdf-parse'],
+  serverExternalPackages: [
+    'unpdf',
+    'ffmpeg-static',
+    'fluent-ffmpeg',
+    'pino',
+    'pino-pretty',
+    'thread-stream',
+  ],
   experimental: {
     optimizeCss: true,
     turbopackSourceMaps: false,
+    turbopackFileSystemCacheForDev: true,
   },
   ...(isDev && {
     allowedDevOrigins: [
@@ -209,12 +214,33 @@ const nextConfig: NextConfig = {
   async redirects() {
     const redirects = []
 
-    // Redirect /building to /blog (legacy URL support)
-    redirects.push({
-      source: '/building/:path*',
-      destination: '/blog/:path*',
-      permanent: true,
-    })
+    // Redirect /building and /blog to /studio (legacy URL support)
+    redirects.push(
+      {
+        source: '/building/:path*',
+        destination: 'https://sim.ai/studio/:path*',
+        permanent: true,
+      },
+      {
+        source: '/blog/:path*',
+        destination: 'https://sim.ai/studio/:path*',
+        permanent: true,
+      }
+    )
+
+    // Move root feeds to studio namespace
+    redirects.push(
+      {
+        source: '/rss.xml',
+        destination: '/studio/rss.xml',
+        permanent: true,
+      },
+      {
+        source: '/sitemap-images.xml',
+        destination: '/studio/sitemap-images.xml',
+        permanent: true,
+      }
+    )
 
     // Only enable domain redirects for the hosted version
     if (isHosted) {

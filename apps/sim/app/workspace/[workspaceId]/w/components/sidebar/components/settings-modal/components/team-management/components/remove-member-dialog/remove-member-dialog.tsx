@@ -1,18 +1,11 @@
-import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { Button, Modal, ModalBody, ModalContent, ModalFooter, ModalHeader } from '@/components/emcn'
 
 interface RemoveMemberDialogProps {
   open: boolean
   memberName: string
   shouldReduceSeats: boolean
   isSelfRemoval?: boolean
+  error?: Error | null
   onOpenChange: (open: boolean) => void
   onShouldReduceSeatsChange: (shouldReduce: boolean) => void
   onConfirmRemove: (shouldReduceSeats: boolean) => Promise<void>
@@ -23,6 +16,7 @@ export function RemoveMemberDialog({
   open,
   memberName,
   shouldReduceSeats,
+  error,
   onOpenChange,
   onShouldReduceSeatsChange,
   onConfirmRemove,
@@ -30,51 +24,59 @@ export function RemoveMemberDialog({
   isSelfRemoval = false,
 }: RemoveMemberDialogProps) {
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{isSelfRemoval ? 'Leave Organization' : 'Remove Team Member'}</DialogTitle>
-          <DialogDescription>
+    <Modal open={open} onOpenChange={onOpenChange}>
+      <ModalContent className='w-[400px]'>
+        <ModalHeader>{isSelfRemoval ? 'Leave Organization' : 'Remove Team Member'}</ModalHeader>
+        <ModalBody>
+          <p className='text-[12px] text-[var(--text-tertiary)]'>
             {isSelfRemoval
               ? 'Are you sure you want to leave this organization? You will lose access to all team resources.'
               : `Are you sure you want to remove ${memberName} from the team?`}{' '}
-            <span className='text-red-500 dark:text-red-500'>This action cannot be undone.</span>
-          </DialogDescription>
-        </DialogHeader>
+            <span className='text-[var(--text-error)]'>This action cannot be undone.</span>
+          </p>
 
-        {!isSelfRemoval && (
-          <div className='py-4'>
-            <div className='flex items-center space-x-2'>
-              <input
-                type='checkbox'
-                id='reduce-seats'
-                className='rounded-[4px]'
-                checked={shouldReduceSeats}
-                onChange={(e) => onShouldReduceSeatsChange(e.target.checked)}
-              />
-              <label htmlFor='reduce-seats' className='text-xs'>
-                Also reduce seat count in my subscription
-              </label>
+          {!isSelfRemoval && (
+            <div className='mt-4'>
+              <div className='flex items-center space-x-2'>
+                <input
+                  type='checkbox'
+                  id='reduce-seats'
+                  className='rounded-[4px]'
+                  checked={shouldReduceSeats}
+                  onChange={(e) => onShouldReduceSeatsChange(e.target.checked)}
+                />
+                <label htmlFor='reduce-seats' className='text-xs'>
+                  Also reduce seat count in my subscription
+                </label>
+              </div>
+              <p className='mt-1 text-[var(--text-muted)] text-xs'>
+                If selected, your team seat count will be reduced by 1, lowering your monthly
+                billing.
+              </p>
             </div>
-            <p className='mt-1 text-muted-foreground text-xs'>
-              If selected, your team seat count will be reduced by 1, lowering your monthly billing.
-            </p>
-          </div>
-        )}
+          )}
 
-        <DialogFooter>
-          <Button variant='outline' onClick={onCancel} className='h-9 rounded-[8px]'>
+          {error && (
+            <div className='mt-2'>
+              <p className='text-[#DC2626] text-[11px] leading-tight dark:text-[#F87171]'>
+                {error instanceof Error && error.message ? error.message : String(error)}
+              </p>
+            </div>
+          )}
+        </ModalBody>
+        <ModalFooter>
+          <Button variant='active' onClick={onCancel}>
             Cancel
           </Button>
           <Button
-            variant='destructive'
+            variant='primary'
             onClick={() => onConfirmRemove(shouldReduceSeats)}
-            className='h-9 rounded-[8px] bg-red-500 text-white transition-all duration-200 hover:bg-red-600 dark:bg-red-500 dark:hover:bg-red-600'
+            className='!bg-[var(--text-error)] !text-white hover:!bg-[var(--text-error)]/90'
           >
             {isSelfRemoval ? 'Leave Organization' : 'Remove'}
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
   )
 }

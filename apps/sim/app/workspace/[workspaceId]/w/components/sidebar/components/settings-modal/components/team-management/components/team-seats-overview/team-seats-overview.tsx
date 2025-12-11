@@ -1,26 +1,22 @@
-import { Building2 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Progress } from '@/components/ui/progress'
+import { Badge, Button } from '@/components/emcn'
 import { Skeleton } from '@/components/ui/skeleton'
-import { DEFAULT_TEAM_TIER_COST_LIMIT } from '@/lib/billing/constants'
 import { checkEnterprisePlan } from '@/lib/billing/subscriptions/utils'
-import { env } from '@/lib/env'
+import { cn } from '@/lib/core/utils/cn'
 
 type Subscription = {
   id: string
   plan: string
   status: string
-  seats?: number
   referenceId: string
   cancelAtPeriodEnd?: boolean
   periodEnd?: number | Date
   trialEnd?: number | Date
-  metadata?: any
 }
 
 interface TeamSeatsOverviewProps {
   subscriptionData: Subscription | null
   isLoadingSubscription: boolean
+  totalSeats: number
   usedSeats: number
   isLoading: boolean
   onConfirmTeamUpgrade: (seats: number) => Promise<void>
@@ -30,7 +26,7 @@ interface TeamSeatsOverviewProps {
 
 function TeamSeatsSkeleton() {
   return (
-    <div className='rounded-[8px] border bg-background p-3 shadow-xs'>
+    <div className='rounded-[8px] border bg-[var(--surface-3)] p-3 shadow-xs'>
       <div className='space-y-2'>
         <div className='flex items-center justify-between'>
           <div className='flex items-center gap-2'>
@@ -39,7 +35,7 @@ function TeamSeatsSkeleton() {
           </div>
           <div className='flex items-center gap-1 text-xs'>
             <Skeleton className='h-4 w-8' />
-            <span className='text-muted-foreground'>/</span>
+            <span className='text-[var(--text-muted)]'>/</span>
             <Skeleton className='h-4 w-8' />
           </div>
         </div>
@@ -56,6 +52,7 @@ function TeamSeatsSkeleton() {
 export function TeamSeatsOverview({
   subscriptionData,
   isLoadingSubscription,
+  totalSeats,
   usedSeats,
   isLoading,
   onConfirmTeamUpgrade,
@@ -68,23 +65,20 @@ export function TeamSeatsOverview({
 
   if (!subscriptionData) {
     return (
-      <div className='rounded-[8px] border bg-background p-3 shadow-xs'>
-        <div className='space-y-4 text-center'>
-          <div className='mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-amber-100'>
-            <Building2 className='h-6 w-6 text-amber-600' />
-          </div>
+      <div className='rounded-[8px] border bg-[var(--surface-3)] p-3 shadow-xs'>
+        <div className='space-y-3 text-center'>
           <div className='space-y-2'>
             <p className='font-medium text-sm'>No Team Subscription Found</p>
-            <p className='text-muted-foreground text-sm'>
+            <p className='text-[var(--text-muted)] text-xs'>
               Your subscription may need to be transferred to this organization.
             </p>
           </div>
           <Button
+            variant='primary'
             onClick={() => {
-              onConfirmTeamUpgrade(2) // Start with 2 seats as default
+              onConfirmTeamUpgrade(2)
             }}
             disabled={isLoading}
-            className='h-9 rounded-[8px]'
           >
             Set Up Team Subscription
           </Button>
@@ -93,55 +87,57 @@ export function TeamSeatsOverview({
     )
   }
 
+  const isEnterprise = checkEnterprisePlan(subscriptionData)
+
   return (
-    <div className='rounded-[8px] border bg-background p-3 shadow-xs'>
+    <div className='rounded-[8px] border bg-[var(--surface-3)] p-3 shadow-xs'>
       <div className='space-y-2'>
-        {/* Seats info and usage - matching team usage layout */}
+        {/* Top row - matching UsageHeader */}
         <div className='flex items-center justify-between'>
           <div className='flex items-center gap-2'>
-            <span className='font-medium text-sm'>Seats</span>
-            {!checkEnterprisePlan(subscriptionData) ? (
-              <span className='text-muted-foreground text-xs'>
-                (${env.TEAM_TIER_COST_LIMIT ?? DEFAULT_TEAM_TIER_COST_LIMIT}/month each)
-              </span>
-            ) : null}
+            <span className='font-medium text-[12px] text-[var(--text-primary)]'>Seats</span>
+            {!isEnterprise && (
+              <Badge
+                className='gradient-text h-[1.125rem] cursor-pointer rounded-[6px] border-gradient-primary/20 bg-gradient-to-b from-gradient-primary via-gradient-secondary to-gradient-primary px-2 py-0 font-medium text-xs'
+                onClick={onAddSeatDialog}
+              >
+                Add Seats
+              </Badge>
+            )}
           </div>
-          <div className='flex items-center gap-1 text-xs tabular-nums'>
-            <span className='text-muted-foreground'>{usedSeats} used</span>
-            <span className='text-muted-foreground'>/</span>
-            <span className='text-muted-foreground'>{subscriptionData.seats || 0} total</span>
+          <div className='flex items-center gap-[4px] text-xs tabular-nums'>
+            <span className='font-medium text-[12px] text-[var(--text-secondary)] tabular-nums'>
+              {usedSeats} used
+            </span>
+            <span className='font-medium text-[12px] text-[var(--text-secondary)]'>/</span>
+            <span className='font-medium text-[12px] text-[var(--text-secondary)] tabular-nums'>
+              {totalSeats} total
+            </span>
           </div>
         </div>
 
-        {/* Progress Bar - matching team usage component */}
-        <Progress value={(usedSeats / (subscriptionData.seats || 1)) * 100} className='h-2' />
+        {/* Pills row - one pill per seat */}
+        <div className='flex items-center gap-[4px]'>
+          {Array.from({ length: totalSeats }).map((_, i) => {
+            const isFilled = i < usedSeats
+            return (
+              <div
+                key={i}
+                className={cn(
+                  'h-[6px] flex-1 rounded-full transition-colors',
+                  isFilled ? 'bg-[#34B5FF]' : 'bg-[var(--border)]'
+                )}
+              />
+            )
+          })}
+        </div>
 
-        {/* Action buttons - below the usage display */}
-        {checkEnterprisePlan(subscriptionData) ? (
-          <div className='text-center'>
-            <p className='text-muted-foreground text-xs'>
+        {/* Enterprise message */}
+        {isEnterprise && (
+          <div className='pt-1 text-center'>
+            <p className='text-[var(--text-muted)] text-xs'>
               Contact support for enterprise usage limit changes
             </p>
-          </div>
-        ) : (
-          <div className='flex gap-2 pt-1'>
-            <Button
-              variant='outline'
-              size='sm'
-              onClick={onReduceSeats}
-              disabled={(subscriptionData.seats || 0) <= 1 || isLoading}
-              className='h-8 flex-1 rounded-[8px]'
-            >
-              Remove Seat
-            </Button>
-            <Button
-              size='sm'
-              onClick={onAddSeatDialog}
-              disabled={isLoading}
-              className='h-8 flex-1 rounded-[8px]'
-            >
-              Add Seat
-            </Button>
           </div>
         )}
       </div>

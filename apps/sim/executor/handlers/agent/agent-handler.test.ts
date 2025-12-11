@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vitest'
-import { isHosted } from '@/lib/environment'
+import { isHosted } from '@/lib/core/config/environment'
 import { getAllBlocks } from '@/blocks'
-import { BlockType } from '@/executor/consts'
+import { BlockType } from '@/executor/constants'
 import { AgentBlockHandler } from '@/executor/handlers/agent/agent-handler'
 import type { ExecutionContext, StreamingExecution } from '@/executor/types'
 import { executeProviderRequest } from '@/providers'
@@ -11,12 +11,14 @@ import { executeTool } from '@/tools'
 
 process.env.NEXT_PUBLIC_APP_URL = 'http://localhost:3000'
 
-vi.mock('@/lib/environment', () => ({
+vi.mock('@/lib/core/config/environment', () => ({
   isHosted: vi.fn().mockReturnValue(false),
   isProd: vi.fn().mockReturnValue(false),
   isDev: vi.fn().mockReturnValue(true),
   isTest: vi.fn().mockReturnValue(false),
   getCostMultiplier: vi.fn().mockReturnValue(1),
+  isEmailVerificationEnabled: false,
+  isBillingEnabled: false,
 }))
 
 vi.mock('@/providers/utils', () => ({
@@ -107,8 +109,7 @@ describe('AgentBlockHandler', () => {
       metadata: { startTime: new Date().toISOString(), duration: 0 },
       environmentVariables: {},
       decisions: { router: new Map(), condition: new Map() },
-      loopIterations: new Map(),
-      loopItems: new Map(),
+      loopExecutions: new Map(),
       completedLoops: new Set(),
       executedBlocks: new Set(),
       activeExecutionPath: new Set(),
@@ -219,7 +220,7 @@ describe('AgentBlockHandler', () => {
         cost: 0.001,
       }
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(mockGetProviderFromModel).toHaveBeenCalledWith('gpt-4o')
       expect(mockFetch).toHaveBeenCalledWith(expect.any(String), expect.any(Object))
@@ -338,7 +339,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       expect(Promise.all).toHaveBeenCalled()
 
@@ -421,7 +422,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -466,7 +467,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -531,7 +532,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -563,7 +564,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       expect(mockFetch).toHaveBeenCalledWith(expect.any(String), expect.any(Object))
     })
@@ -601,7 +602,7 @@ describe('AgentBlockHandler', () => {
         cost: 0.001,
       }
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(mockTransformBlockTool).toHaveBeenCalledWith(
         inputs.tools[0],
@@ -656,7 +657,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       expect(mockFetch).toHaveBeenCalledWith(expect.any(String), expect.any(Object))
     })
@@ -692,7 +693,7 @@ describe('AgentBlockHandler', () => {
           '{"type":"object","properties":{"result":{"type":"string"},"score":{"type":"number"}}}',
       }
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(result).toEqual({
         result: 'Success',
@@ -732,7 +733,7 @@ describe('AgentBlockHandler', () => {
         responseFormat: '', // Empty string
       }
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(result).toEqual({
         content: 'Regular text response',
@@ -775,7 +776,7 @@ describe('AgentBlockHandler', () => {
       }
 
       // Should not throw an error, but continue with default behavior
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(result).toEqual({
         content: 'Regular text response',
@@ -818,7 +819,7 @@ describe('AgentBlockHandler', () => {
       }
 
       // Should not throw an error, but continue with default behavior
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(result).toEqual({
         content: 'Regular text response',
@@ -840,7 +841,7 @@ describe('AgentBlockHandler', () => {
       mockGetProviderFromModel.mockReturnValue('openai')
       mockFetch.mockRejectedValue(new Error('Provider API Error'))
 
-      await expect(handler.execute(mockBlock, inputs, mockContext)).rejects.toThrow(
+      await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
         'Provider API Error'
       )
     })
@@ -888,7 +889,7 @@ describe('AgentBlockHandler', () => {
       mockContext.stream = true
       mockContext.selectedOutputs = [mockBlock.id]
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(result).toHaveProperty('stream')
       expect(result).toHaveProperty('execution')
@@ -957,7 +958,7 @@ describe('AgentBlockHandler', () => {
       mockContext.stream = true
       mockContext.selectedOutputs = [mockBlock.id]
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(result).toHaveProperty('stream')
       expect(result).toHaveProperty('execution')
@@ -1014,7 +1015,7 @@ describe('AgentBlockHandler', () => {
       mockContext.stream = true
       mockContext.selectedOutputs = [mockBlock.id]
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       expect(result).toHaveProperty('stream')
       expect(result).toHaveProperty('execution')
@@ -1040,7 +1041,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -1090,7 +1091,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -1129,7 +1130,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -1144,11 +1145,13 @@ describe('AgentBlockHandler', () => {
       expect(systemMessages[0].content).toBe('You are a helpful assistant.')
     })
 
-    it('should prioritize explicit systemPrompt over system messages in memories', async () => {
+    it('should prioritize messages array system message over system messages in memories', async () => {
       const inputs = {
         model: 'gpt-4o',
-        systemPrompt: 'You are a helpful assistant.',
-        userPrompt: 'What should I do?',
+        messages: [
+          { role: 'system' as const, content: 'You are a helpful assistant.' },
+          { role: 'user' as const, content: 'What should I do?' },
+        ],
         memories: [
           { role: 'system', content: 'Old system message from memories.' },
           { role: 'user', content: 'Hello!' },
@@ -1159,38 +1162,37 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
 
       // Verify messages were built correctly
       expect(requestBody.messages).toBeDefined()
-      expect(requestBody.messages.length).toBe(4) // explicit system + 2 non-system memories + user prompt
+      expect(requestBody.messages.length).toBe(5) // memory system + 2 non-system memories + 2 from messages array
 
-      // Check only one system message exists and it's the explicit one
-      const systemMessages = requestBody.messages.filter((msg: any) => msg.role === 'system')
-      expect(systemMessages.length).toBe(1)
-      expect(systemMessages[0].content).toBe('You are a helpful assistant.')
-
-      // Verify the explicit system prompt is first
+      // All messages should be present (memories first, then messages array)
+      // Memory messages come first
       expect(requestBody.messages[0].role).toBe('system')
-      expect(requestBody.messages[0].content).toBe('You are a helpful assistant.')
-
-      // Verify conversation order is preserved
+      expect(requestBody.messages[0].content).toBe('Old system message from memories.')
       expect(requestBody.messages[1].role).toBe('user')
       expect(requestBody.messages[1].content).toBe('Hello!')
       expect(requestBody.messages[2].role).toBe('assistant')
       expect(requestBody.messages[2].content).toBe('Hi there!')
-      expect(requestBody.messages[3].role).toBe('user')
-      expect(requestBody.messages[3].content).toBe('What should I do?')
+      // Then messages array
+      expect(requestBody.messages[3].role).toBe('system')
+      expect(requestBody.messages[3].content).toBe('You are a helpful assistant.')
+      expect(requestBody.messages[4].role).toBe('user')
+      expect(requestBody.messages[4].content).toBe('What should I do?')
     })
 
-    it('should handle multiple system messages in memories with explicit systemPrompt', async () => {
+    it('should handle multiple system messages in memories with messages array', async () => {
       const inputs = {
         model: 'gpt-4o',
-        systemPrompt: 'You are a helpful assistant.',
-        userPrompt: 'Continue our conversation.',
+        messages: [
+          { role: 'system' as const, content: 'You are a helpful assistant.' },
+          { role: 'user' as const, content: 'Continue our conversation.' },
+        ],
         memories: [
           { role: 'system', content: 'First system message.' },
           { role: 'user', content: 'Hello!' },
@@ -1203,29 +1205,30 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
 
       // Verify messages were built correctly
       expect(requestBody.messages).toBeDefined()
-      expect(requestBody.messages.length).toBe(4) // explicit system + 2 non-system memories + user prompt
+      expect(requestBody.messages.length).toBe(7) // 5 memory messages (3 system + 2 conversation) + 2 from messages array
 
-      // Check only one system message exists and message order is preserved
-      const systemMessages = requestBody.messages.filter((msg: any) => msg.role === 'system')
-      expect(systemMessages.length).toBe(1)
-      expect(systemMessages[0].content).toBe('You are a helpful assistant.')
-
-      // Verify conversation flow is preserved
+      // All messages should be present in order
       expect(requestBody.messages[0].role).toBe('system')
-      expect(requestBody.messages[0].content).toBe('You are a helpful assistant.')
+      expect(requestBody.messages[0].content).toBe('First system message.')
       expect(requestBody.messages[1].role).toBe('user')
       expect(requestBody.messages[1].content).toBe('Hello!')
-      expect(requestBody.messages[2].role).toBe('assistant')
-      expect(requestBody.messages[2].content).toBe('Hi there!')
-      expect(requestBody.messages[3].role).toBe('user')
-      expect(requestBody.messages[3].content).toBe('Continue our conversation.')
+      expect(requestBody.messages[2].role).toBe('system')
+      expect(requestBody.messages[2].content).toBe('Second system message.')
+      expect(requestBody.messages[3].role).toBe('assistant')
+      expect(requestBody.messages[3].content).toBe('Hi there!')
+      expect(requestBody.messages[4].role).toBe('system')
+      expect(requestBody.messages[4].content).toBe('Third system message.')
+      expect(requestBody.messages[5].role).toBe('system')
+      expect(requestBody.messages[5].content).toBe('You are a helpful assistant.')
+      expect(requestBody.messages[6].role).toBe('user')
+      expect(requestBody.messages[6].content).toBe('Continue our conversation.')
     })
 
     it('should preserve multiple system messages when no explicit systemPrompt is provided', async () => {
@@ -1243,7 +1246,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -1285,7 +1288,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       const fetchCall = mockFetch.mock.calls[0]
       const requestBody = JSON.parse(fetchCall[1].body)
@@ -1312,7 +1315,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('azure-openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       expect(mockFetch).toHaveBeenCalledWith(expect.any(String), expect.any(Object))
 
@@ -1340,7 +1343,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       expect(mockFetch).toHaveBeenCalledWith(expect.any(String), expect.any(Object))
 
@@ -1367,7 +1370,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, mockContext)
+      await handler.execute(mockContext, mockBlock, inputs)
 
       expect(mockFetch).toHaveBeenCalledWith(expect.any(String), expect.any(Object))
 
@@ -1487,7 +1490,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      const result = await handler.execute(mockBlock, inputs, mcpContext)
+      const result = await handler.execute(mcpContext, mockBlock, inputs)
 
       expect((result as any).content).toBe('I will use MCP tools to help you.')
       expect((result as any).toolCalls.count).toBe(2)
@@ -1572,7 +1575,7 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      const result = await handler.execute(mockBlock, inputs, mcpContext)
+      const result = await handler.execute(mcpContext, mockBlock, inputs)
 
       expect((result as any).content).toBe('Let me try to use this tool.')
       expect((result as any).toolCalls.count).toBe(1)
@@ -1644,7 +1647,7 @@ describe('AgentBlockHandler', () => {
         usageControl: tool.usageControl,
       }))
 
-      const result = await handler.execute(mockBlock, inputs, mockContext)
+      const result = await handler.execute(mockContext, mockBlock, inputs)
 
       // Verify that the agent executed successfully with MCP tools
       expect(result).toBeDefined()
@@ -1712,9 +1715,343 @@ describe('AgentBlockHandler', () => {
 
       mockGetProviderFromModel.mockReturnValue('openai')
 
-      await handler.execute(mockBlock, inputs, contextWithWorkspace)
+      await handler.execute(contextWithWorkspace, mockBlock, inputs)
 
       expect(contextWithWorkspace.workspaceId).toBe('test-workspace-456')
+    })
+
+    it('should use cached schema for MCP tools (no discovery needed)', async () => {
+      const fetchCalls: any[] = []
+
+      mockFetch.mockImplementation((url: string, options: any) => {
+        fetchCalls.push({ url, options })
+
+        if (url.includes('/api/providers')) {
+          return Promise.resolve({
+            ok: true,
+            headers: {
+              get: (name: string) => (name === 'Content-Type' ? 'application/json' : null),
+            },
+            json: () =>
+              Promise.resolve({
+                content: 'Used MCP tool successfully',
+                model: 'gpt-4o',
+                tokens: { prompt: 10, completion: 10, total: 20 },
+                toolCalls: [],
+                timing: { total: 50 },
+              }),
+          })
+        }
+
+        if (url.includes('/api/mcp/tools/execute')) {
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                success: true,
+                data: { output: { content: [{ type: 'text', text: 'Tool executed' }] } },
+              }),
+          })
+        }
+
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+      })
+
+      const inputs = {
+        model: 'gpt-4o',
+        userPrompt: 'Use the MCP tool',
+        apiKey: 'test-api-key',
+        tools: [
+          {
+            type: 'mcp',
+            title: 'list_files',
+            schema: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Directory path' },
+              },
+              required: ['path'],
+            },
+            params: {
+              serverId: 'mcp-server-123',
+              toolName: 'list_files',
+              serverName: 'filesystem',
+            },
+            usageControl: 'auto' as const,
+          },
+        ],
+      }
+
+      const contextWithWorkspace = {
+        ...mockContext,
+        workspaceId: 'test-workspace-123',
+        workflowId: 'test-workflow-456',
+      }
+
+      mockGetProviderFromModel.mockReturnValue('openai')
+
+      await handler.execute(contextWithWorkspace, mockBlock, inputs)
+
+      const discoveryCalls = fetchCalls.filter((c) => c.url.includes('/api/mcp/tools/discover'))
+      expect(discoveryCalls.length).toBe(0)
+
+      const providerCalls = fetchCalls.filter((c) => c.url.includes('/api/providers'))
+      expect(providerCalls.length).toBe(1)
+    })
+
+    it('should pass toolSchema to execution endpoint when using cached schema', async () => {
+      let executionCall: any = null
+
+      mockFetch.mockImplementation((url: string, options: any) => {
+        if (url.includes('/api/providers')) {
+          return Promise.resolve({
+            ok: true,
+            headers: {
+              get: (name: string) => (name === 'Content-Type' ? 'application/json' : null),
+            },
+            json: () =>
+              Promise.resolve({
+                content: 'Tool executed',
+                model: 'gpt-4o',
+                tokens: { prompt: 10, completion: 10, total: 20 },
+                toolCalls: [
+                  {
+                    name: 'search_files',
+                    arguments: { query: 'test' },
+                    result: { success: true, output: {} },
+                  },
+                ],
+                timing: { total: 50 },
+              }),
+          })
+        }
+
+        if (url.includes('/api/mcp/tools/execute')) {
+          executionCall = { url, body: JSON.parse(options.body) }
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                success: true,
+                data: { output: { content: [{ type: 'text', text: 'Search results' }] } },
+              }),
+          })
+        }
+
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+      })
+
+      const cachedSchema = {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query' },
+        },
+        required: ['query'],
+      }
+
+      const inputs = {
+        model: 'gpt-4o',
+        userPrompt: 'Search for files',
+        apiKey: 'test-api-key',
+        tools: [
+          {
+            type: 'mcp',
+            title: 'search_files',
+            schema: cachedSchema,
+            params: {
+              serverId: 'mcp-search-server',
+              toolName: 'search_files',
+              serverName: 'search',
+            },
+            usageControl: 'auto' as const,
+          },
+        ],
+      }
+
+      const contextWithWorkspace = {
+        ...mockContext,
+        workspaceId: 'test-workspace-123',
+        workflowId: 'test-workflow-456',
+      }
+
+      mockGetProviderFromModel.mockReturnValue('openai')
+
+      await handler.execute(contextWithWorkspace, mockBlock, inputs)
+
+      const providerCalls = mockFetch.mock.calls.filter((c: any) => c[0].includes('/api/providers'))
+      expect(providerCalls.length).toBe(1)
+
+      const providerRequestBody = JSON.parse(providerCalls[0][1].body)
+      expect(providerRequestBody.tools).toBeDefined()
+      expect(providerRequestBody.tools.length).toBe(1)
+      expect(providerRequestBody.tools[0].name).toBe('search_files')
+    })
+
+    it('should handle multiple MCP tools from the same server efficiently', async () => {
+      const fetchCalls: any[] = []
+
+      mockFetch.mockImplementation((url: string, options: any) => {
+        fetchCalls.push({ url, options })
+
+        if (url.includes('/api/providers')) {
+          return Promise.resolve({
+            ok: true,
+            headers: {
+              get: (name: string) => (name === 'Content-Type' ? 'application/json' : null),
+            },
+            json: () =>
+              Promise.resolve({
+                content: 'Used tools',
+                model: 'gpt-4o',
+                tokens: { prompt: 10, completion: 10, total: 20 },
+                toolCalls: [],
+                timing: { total: 50 },
+              }),
+          })
+        }
+
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+      })
+
+      const inputs = {
+        model: 'gpt-4o',
+        userPrompt: 'Use all the tools',
+        apiKey: 'test-api-key',
+        tools: [
+          {
+            type: 'mcp',
+            title: 'tool_1',
+            schema: { type: 'object', properties: {} },
+            params: {
+              serverId: 'same-server',
+              toolName: 'tool_1',
+              serverName: 'server',
+            },
+            usageControl: 'auto' as const,
+          },
+          {
+            type: 'mcp',
+            title: 'tool_2',
+            schema: { type: 'object', properties: {} },
+            params: {
+              serverId: 'same-server',
+              toolName: 'tool_2',
+              serverName: 'server',
+            },
+            usageControl: 'auto' as const,
+          },
+          {
+            type: 'mcp',
+            title: 'tool_3',
+            schema: { type: 'object', properties: {} },
+            params: {
+              serverId: 'same-server',
+              toolName: 'tool_3',
+              serverName: 'server',
+            },
+            usageControl: 'auto' as const,
+          },
+        ],
+      }
+
+      const contextWithWorkspace = {
+        ...mockContext,
+        workspaceId: 'test-workspace-123',
+        workflowId: 'test-workflow-456',
+      }
+
+      mockGetProviderFromModel.mockReturnValue('openai')
+
+      await handler.execute(contextWithWorkspace, mockBlock, inputs)
+
+      const discoveryCalls = fetchCalls.filter((c) => c.url.includes('/api/mcp/tools/discover'))
+      expect(discoveryCalls.length).toBe(0)
+
+      const providerCalls = fetchCalls.filter((c) => c.url.includes('/api/providers'))
+      expect(providerCalls.length).toBe(1)
+
+      const providerRequestBody = JSON.parse(providerCalls[0].options.body)
+      expect(providerRequestBody.tools.length).toBe(3)
+    })
+
+    it('should should fallback to discovery for MCP tools without cached schema', async () => {
+      const fetchCalls: any[] = []
+
+      mockFetch.mockImplementation((url: string, options: any) => {
+        fetchCalls.push({ url, options })
+
+        if (url.includes('/api/mcp/tools/discover')) {
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                success: true,
+                data: {
+                  tools: [
+                    {
+                      name: 'legacy_tool',
+                      description: 'A legacy tool without cached schema',
+                      inputSchema: { type: 'object', properties: {} },
+                      serverName: 'legacy-server',
+                    },
+                  ],
+                },
+              }),
+          })
+        }
+
+        if (url.includes('/api/providers')) {
+          return Promise.resolve({
+            ok: true,
+            headers: {
+              get: (name: string) => (name === 'Content-Type' ? 'application/json' : null),
+            },
+            json: () =>
+              Promise.resolve({
+                content: 'Used legacy tool',
+                model: 'gpt-4o',
+                tokens: { prompt: 10, completion: 10, total: 20 },
+                toolCalls: [],
+                timing: { total: 50 },
+              }),
+          })
+        }
+
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+      })
+
+      const inputs = {
+        model: 'gpt-4o',
+        userPrompt: 'Use the legacy tool',
+        apiKey: 'test-api-key',
+        tools: [
+          {
+            type: 'mcp',
+            title: 'legacy_tool',
+            params: {
+              serverId: 'mcp-legacy-server',
+              toolName: 'legacy_tool',
+              serverName: 'legacy-server',
+            },
+            usageControl: 'auto' as const,
+          },
+        ],
+      }
+
+      const contextWithWorkspace = {
+        ...mockContext,
+        workspaceId: 'test-workspace-123',
+        workflowId: 'test-workflow-456',
+      }
+
+      mockGetProviderFromModel.mockReturnValue('openai')
+
+      await handler.execute(contextWithWorkspace, mockBlock, inputs)
+
+      const discoveryCalls = fetchCalls.filter((c) => c.url.includes('/api/mcp/tools/discover'))
+      expect(discoveryCalls.length).toBe(1)
+
+      expect(discoveryCalls[0].url).toContain('serverId=mcp-legacy-server')
     })
   })
 })

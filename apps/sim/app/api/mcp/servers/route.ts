@@ -17,7 +17,7 @@ export const dynamic = 'force-dynamic'
  * Check if transport type requires a URL
  */
 function isUrlBasedTransport(transport: McpTransport): boolean {
-  return transport === 'http' || transport === 'sse' || transport === 'streamable-http'
+  return transport === 'streamable-http'
 }
 
 /**
@@ -109,7 +109,7 @@ export const POST = withMcpAuth('write')(
 
       // Track MCP server registration
       try {
-        const { trackPlatformEvent } = await import('@/lib/telemetry/tracer')
+        const { trackPlatformEvent } = await import('@/lib/core/telemetry')
         trackPlatformEvent('platform.mcp.server_added', {
           'mcp.server_id': serverId,
           'mcp.server_name': body.name,

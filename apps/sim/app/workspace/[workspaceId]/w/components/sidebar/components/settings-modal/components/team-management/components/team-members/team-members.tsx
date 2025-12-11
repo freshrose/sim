@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react'
-import { LogOut, UserX, X } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useState } from 'react'
+import { Button } from '@/components/emcn'
+import { UserAvatar } from '@/components/user-avatar/user-avatar'
 import { createLogger } from '@/lib/logs/console/logger'
-import type { Invitation, Member, Organization } from '@/stores/organization'
+import type { Invitation, Member, Organization } from '@/lib/workspaces/organization'
+import { useCancelInvitation, useOrganizationMembers } from '@/hooks/queries/organization'
 
 const logger = createLogger('TeamMembers')
 
@@ -12,7 +12,6 @@ interface TeamMembersProps {
   currentUserEmail: string
   isAdminOrOwner: boolean
   onRemoveMember: (member: Member) => void
-  onCancelInvitation: (invitationId: string) => void
 }
 
 interface BaseItem {
@@ -20,6 +19,8 @@ interface BaseItem {
   name: string
   email: string
   avatarInitial: string
+  avatarUrl?: string | null
+  userId?: string
   usage: string
 }
 
@@ -41,43 +42,23 @@ export function TeamMembers({
   currentUserEmail,
   isAdminOrOwner,
   onRemoveMember,
-  onCancelInvitation,
 }: TeamMembersProps) {
-  const [memberUsageData, setMemberUsageData] = useState<Record<string, number>>({})
-  const [isLoadingUsage, setIsLoadingUsage] = useState(false)
-  const [cancellingInvitations, setCancellingInvitations] = useState<Set<string>>(new Set())
+  // Fetch member usage data using React Query
+  const { data: memberUsageResponse, isLoading: isLoadingUsage } = useOrganizationMembers(
+    organization?.id || ''
+  )
 
-  // Fetch member usage data when organization changes and user is admin
-  useEffect(() => {
-    const fetchMemberUsage = async () => {
-      if (!organization?.id || !isAdminOrOwner) return
+  const cancelInvitationMutation = useCancelInvitation()
 
-      setIsLoadingUsage(true)
-      try {
-        const response = await fetch(`/api/organizations/${organization.id}/members?include=usage`)
-        if (response.ok) {
-          const result = await response.json()
-          const usageMap: Record<string, number> = {}
-
-          if (result.data) {
-            result.data.forEach((member: any) => {
-              if (member.currentPeriodCost !== null && member.currentPeriodCost !== undefined) {
-                usageMap[member.userId] = Number.parseFloat(member.currentPeriodCost.toString())
-              }
-            })
-          }
-
-          setMemberUsageData(usageMap)
-        }
-      } catch (error) {
-        logger.error('Failed to fetch member usage data', { error })
-      } finally {
-        setIsLoadingUsage(false)
+  // Build usage data map from response
+  const memberUsageData: Record<string, number> = {}
+  if (memberUsageResponse?.data) {
+    memberUsageResponse.data.forEach((member: any) => {
+      if (member.currentPeriodCost !== null && member.currentPeriodCost !== undefined) {
+        memberUsageData[member.userId] = Number.parseFloat(member.currentPeriodCost.toString())
       }
-    }
-
-    fetchMemberUsage()
-  }, [organization?.id, isAdminOrOwner])
+    })
+  }
 
   // Combine members and pending invitations into a single list
   const teamItems: TeamMemberItem[] = []
@@ -95,6 +76,8 @@ export function TeamMembers({
         name,
         email: member.user?.email || '',
         avatarInitial: name.charAt(0).toUpperCase(),
+        avatarUrl: member.user?.image,
+        userId: member.user?.id,
         usage: `$${usageAmount.toFixed(2)}`,
         role: member.role,
         member,
@@ -118,6 +101,8 @@ export function TeamMembers({
         name: emailPrefix,
         email: invitation.email,
         avatarInitial: emailPrefix.charAt(0).toUpperCase(),
+        avatarUrl: null,
+        userId: invitation.email, // Use email as fallback for color generation
         usage: '-',
         invitation,
       }
@@ -127,7 +112,7 @@ export function TeamMembers({
   }
 
   if (teamItems.length === 0) {
-    return <div className='text-center text-muted-foreground text-sm'>No team members yet.</div>
+    return <div className='text-center text-[var(--text-muted)] text-sm'>No team members yet.</div>
   }
 
   // Check if current user can leave (is a member but not owner)
@@ -135,11 +120,20 @@ export function TeamMembers({
   const canLeaveOrganization =
     currentUserMember && currentUserMember.role !== 'owner' && currentUserMember.user?.id
 
-  // Wrap onCancelInvitation to manage loading state
+  // Track which invitations are being cancelled for individual loading states
+  const [cancellingInvitations, setCancellingInvitations] = useState<Set<string>>(new Set())
+
   const handleCancelInvitation = async (invitationId: string) => {
+    if (!organization?.id) return
+
     setCancellingInvitations((prev) => new Set([...prev, invitationId]))
     try {
-      await onCancelInvitation(invitationId)
+      await cancelInvitationMutation.mutateAsync({
+        invitationId,
+        orgId: organization.id,
+      })
+    } catch (error) {
+      logger.error('Failed to cancel invitation', { error })
     } finally {
       setCancellingInvitations((prev) => {
         const next = new Set(prev)
@@ -153,7 +147,7 @@ export function TeamMembers({
     <div className='flex flex-col gap-4'>
       {/* Header - simple like account page */}
       <div>
-        <h4 className='font-medium text-sm'>Team Members</h4>
+        <h4 className='font-medium text-[13px]'>Team Members</h4>
       </div>
 
       {/* Members list - clean like account page */}
@@ -163,15 +157,12 @@ export function TeamMembers({
             {/* Member info */}
             <div className='flex flex-1 items-center gap-3'>
               {/* Avatar */}
-              <div
-                className={`flex h-8 w-8 items-center justify-center rounded-full font-medium text-sm ${
-                  item.type === 'member'
-                    ? 'bg-primary/10 text-muted-foreground'
-                    : 'bg-muted text-muted-foreground'
-                }`}
-              >
-                {item.avatarInitial}
-              </div>
+              <UserAvatar
+                userId={item.userId || item.email}
+                userName={item.name}
+                avatarUrl={item.avatarUrl}
+                size={32}
+              />
 
               {/* Name and email */}
               <div className='min-w-0 flex-1'>
@@ -182,29 +173,29 @@ export function TeamMembers({
                       className={`inline-flex h-[1.125rem] items-center rounded-[6px] px-2 py-0 font-medium text-xs ${
                         item.role === 'owner'
                           ? 'gradient-text border-gradient-primary/20 bg-gradient-to-b from-gradient-primary via-gradient-secondary to-gradient-primary'
-                          : 'bg-primary/10 text-muted-foreground'
+                          : 'bg-[var(--surface-3)] text-[var(--text-muted)]'
                       } `}
                     >
                       {item.role.charAt(0).toUpperCase() + item.role.slice(1)}
                     </span>
                   )}
                   {item.type === 'invitation' && (
-                    <span className='inline-flex h-[1.125rem] items-center rounded-[6px] bg-muted px-2 py-0 font-medium text-muted-foreground text-xs'>
+                    <span className='inline-flex h-[1.125rem] items-center rounded-[6px] bg-[var(--surface-3)] px-2 py-0 font-medium text-[var(--text-muted)] text-xs'>
                       Pending
                     </span>
                   )}
                 </div>
-                <div className='truncate text-muted-foreground text-xs'>{item.email}</div>
+                <div className='truncate text-[var(--text-muted)] text-xs'>{item.email}</div>
               </div>
 
               {/* Usage stats - matching subscription layout */}
               {isAdminOrOwner && (
                 <div className='hidden items-center text-xs tabular-nums sm:flex'>
                   <div className='text-center'>
-                    <div className='text-muted-foreground'>Usage</div>
+                    <div className='text-[var(--text-muted)]'>Usage</div>
                     <div className='font-medium'>
                       {isLoadingUsage && item.type === 'member' ? (
-                        <span className='inline-block h-3 w-12 animate-pulse rounded bg-muted' />
+                        <span className='inline-block h-3 w-12 animate-pulse rounded bg-[var(--surface-3)]' />
                       ) : (
                         item.usage
                       )}
@@ -221,45 +212,25 @@ export function TeamMembers({
                 item.type === 'member' &&
                 item.role !== 'owner' &&
                 item.email !== currentUserEmail && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant='outline'
-                        size='sm'
-                        onClick={() => onRemoveMember(item.member)}
-                        className='h-8 w-8 rounded-[8px] p-0'
-                      >
-                        <UserX className='h-4 w-4' />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent side='left'>Remove Member</TooltipContent>
-                  </Tooltip>
+                  <Button
+                    variant='ghost'
+                    onClick={() => onRemoveMember(item.member)}
+                    className='h-8 text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                  >
+                    Remove
+                  </Button>
                 )}
 
               {/* Admin can cancel invitations */}
               {isAdminOrOwner && item.type === 'invitation' && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant='outline'
-                      size='sm'
-                      onClick={() => handleCancelInvitation(item.invitation.id)}
-                      disabled={cancellingInvitations.has(item.invitation.id)}
-                      className='h-8 w-8 rounded-[8px] p-0'
-                    >
-                      {cancellingInvitations.has(item.invitation.id) ? (
-                        <span className='h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent' />
-                      ) : (
-                        <X className='h-4 w-4' />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side='left'>
-                    {cancellingInvitations.has(item.invitation.id)
-                      ? 'Cancelling...'
-                      : 'Cancel Invitation'}
-                  </TooltipContent>
-                </Tooltip>
+                <Button
+                  variant='ghost'
+                  onClick={() => handleCancelInvitation(item.invitation.id)}
+                  disabled={cancellingInvitations.has(item.invitation.id)}
+                  className='h-8 text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                >
+                  {cancellingInvitations.has(item.invitation.id) ? 'Cancelling...' : 'Cancel'}
+                </Button>
               )}
             </div>
           </div>
@@ -268,10 +239,9 @@ export function TeamMembers({
 
       {/* Leave Organization button */}
       {canLeaveOrganization && (
-        <div className='border-t pt-4'>
+        <div className='mt-4 border-[var(--border-muted)] border-t pt-4'>
           <Button
-            variant='outline'
-            size='default'
+            variant='default'
             onClick={() => {
               if (!currentUserMember?.user?.id) {
                 logger.error('Cannot leave organization: missing user ID', { currentUserMember })
@@ -279,9 +249,7 @@ export function TeamMembers({
               }
               onRemoveMember(currentUserMember)
             }}
-            className='w-full hover:bg-muted'
           >
-            <LogOut className='mr-2 h-4 w-4' />
             Leave Organization
           </Button>
         </div>

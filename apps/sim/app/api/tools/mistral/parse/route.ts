@@ -1,11 +1,12 @@
 import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { checkHybridAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { getBaseUrl } from '@/lib/core/utils/urls'
 import { createLogger } from '@/lib/logs/console/logger'
-import { getPresignedUrl } from '@/lib/uploads'
-import { extractStorageKey } from '@/lib/uploads/file-utils'
-import { getBaseUrl } from '@/lib/urls/utils'
-import { generateRequestId } from '@/lib/utils'
+import { StorageService } from '@/lib/uploads'
+import { extractStorageKey, inferContextFromKey } from '@/lib/uploads/utils/file-utils'
+import { verifyFileAccess } from '@/app/api/files/authorization'
 
 export const dynamic = 'force-dynamic'
 
@@ -27,34 +28,62 @@ export async function POST(request: NextRequest) {
   try {
     const authResult = await checkHybridAuth(request, { requireWorkflowId: false })
 
-    if (!authResult.success) {
-      logger.warn(`[${requestId}] Unauthorized Mistral parse attempt: ${authResult.error}`)
+    if (!authResult.success || !authResult.userId) {
+      logger.warn(`[${requestId}] Unauthorized Mistral parse attempt`, {
+        error: authResult.error || 'Missing userId',
+      })
       return NextResponse.json(
         {
           success: false,
-          error: authResult.error || 'Authentication required',
+          error: authResult.error || 'Unauthorized',
         },
         { status: 401 }
       )
     }
 
+    const userId = authResult.userId
     const body = await request.json()
     const validatedData = MistralParseSchema.parse(body)
 
     logger.info(`[${requestId}] Mistral parse request`, {
       filePath: validatedData.filePath,
       isWorkspaceFile: validatedData.filePath.includes('/api/files/serve/'),
+      userId,
     })
 
     let fileUrl = validatedData.filePath
 
-    // Check if it's an internal workspace file path
     if (validatedData.filePath?.includes('/api/files/serve/')) {
       try {
         const storageKey = extractStorageKey(validatedData.filePath)
-        // Generate 5-minute presigned URL for external API access
-        fileUrl = await getPresignedUrl(storageKey, 5 * 60)
-        logger.info(`[${requestId}] Generated presigned URL for workspace file`)
+
+        const context = inferContextFromKey(storageKey)
+
+        const hasAccess = await verifyFileAccess(
+          storageKey,
+          userId,
+          undefined, // customConfig
+          context, // context
+          false // isLocal
+        )
+
+        if (!hasAccess) {
+          logger.warn(`[${requestId}] Unauthorized presigned URL generation attempt`, {
+            userId,
+            key: storageKey,
+            context,
+          })
+          return NextResponse.json(
+            {
+              success: false,
+              error: 'File not found',
+            },
+            { status: 404 }
+          )
+        }
+
+        fileUrl = await StorageService.generatePresignedDownloadUrl(storageKey, context, 5 * 60)
+        logger.info(`[${requestId}] Generated presigned URL for ${context} file`)
       } catch (error) {
         logger.error(`[${requestId}] Failed to generate presigned URL:`, error)
         return NextResponse.json(
@@ -66,12 +95,10 @@ export async function POST(request: NextRequest) {
         )
       }
     } else if (validatedData.filePath?.startsWith('/')) {
-      // Convert relative path to absolute URL
       const baseUrl = getBaseUrl()
       fileUrl = `${baseUrl}${validatedData.filePath}`
     }
 
-    // Call Mistral API with the resolved URL
     const mistralBody: any = {
       model: 'mistral-ocr-latest',
       document: {

@@ -4,13 +4,23 @@ import fsPromises, { readFile } from 'fs/promises'
 import path from 'path'
 import binaryExtensionsList from 'binary-extensions'
 import { type NextRequest, NextResponse } from 'next/server'
+import { checkHybridAuth } from '@/lib/auth/hybrid'
+import { validateExternalUrl } from '@/lib/core/security/input-validation'
 import { isSupportedFileType, parseFile } from '@/lib/file-parsers'
 import { createLogger } from '@/lib/logs/console/logger'
-import { validateExternalUrl } from '@/lib/security/input-validation'
-import { downloadFile, isUsingCloudStorage } from '@/lib/uploads'
-import { extractStorageKey } from '@/lib/uploads/file-utils'
-import { UPLOAD_DIR_SERVER } from '@/lib/uploads/setup.server'
-import '@/lib/uploads/setup.server'
+import { isUsingCloudStorage, type StorageContext, StorageService } from '@/lib/uploads'
+import { UPLOAD_DIR_SERVER } from '@/lib/uploads/core/setup.server'
+import { getFileMetadataByKey } from '@/lib/uploads/server/metadata'
+import {
+  extractCleanFilename,
+  extractStorageKey,
+  extractWorkspaceIdFromExecutionKey,
+  getViewerUrl,
+  inferContextFromKey,
+} from '@/lib/uploads/utils/file-utils'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
+import { verifyFileAccess } from '@/app/api/files/authorization'
+import '@/lib/uploads/core/setup.server'
 
 export const dynamic = 'force-dynamic'
 
@@ -24,6 +34,8 @@ interface ParseResult {
   content?: string
   error?: string
   filePath: string
+  originalName?: string // Original filename from database (for workspace files)
+  viewerUrl?: string | null // Viewer URL for the file if available
   metadata?: {
     fileType: string
     size: number
@@ -69,6 +81,23 @@ export async function POST(request: NextRequest) {
   const startTime = Date.now()
 
   try {
+    const authResult = await checkHybridAuth(request, { requireWorkflowId: true })
+
+    if (!authResult.success) {
+      logger.warn('Unauthorized file parse request', {
+        error: authResult.error || 'Authentication failed',
+      })
+      return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 })
+    }
+
+    if (!authResult.userId) {
+      logger.warn('File parse request missing userId', {
+        authType: authResult.authType,
+      })
+      return NextResponse.json({ success: false, error: 'User context required' }, { status: 401 })
+    }
+
+    const userId = authResult.userId
     const requestData = await request.json()
     const { filePath, fileType, workspaceId } = requestData
 
@@ -76,7 +105,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, error: 'No file path provided' }, { status: 400 })
     }
 
-    logger.info('File parse request received:', { filePath, fileType, workspaceId })
+    logger.info('File parse request received:', { filePath, fileType, workspaceId, userId })
 
     if (Array.isArray(filePath)) {
       const results = []
@@ -90,22 +119,25 @@ export async function POST(request: NextRequest) {
           continue
         }
 
-        const result = await parseFileSingle(path, fileType, workspaceId)
+        const result = await parseFileSingle(path, fileType, workspaceId, userId)
         if (result.metadata) {
           result.metadata.processingTime = Date.now() - startTime
         }
 
         if (result.success) {
+          const displayName =
+            result.originalName || extractCleanFilename(result.filePath) || 'unknown'
           results.push({
             success: true,
             output: {
               content: result.content,
-              name: result.filePath.split('/').pop() || 'unknown',
+              name: displayName,
               fileType: result.metadata?.fileType || 'application/octet-stream',
               size: result.metadata?.size || 0,
               binary: false,
             },
             filePath: result.filePath,
+            viewerUrl: result.viewerUrl,
           })
         } else {
           results.push(result)
@@ -118,22 +150,25 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    const result = await parseFileSingle(filePath, fileType, workspaceId)
+    const result = await parseFileSingle(filePath, fileType, workspaceId, userId)
 
     if (result.metadata) {
       result.metadata.processingTime = Date.now() - startTime
     }
 
     if (result.success) {
+      const displayName = result.originalName || extractCleanFilename(result.filePath) || 'unknown'
       return NextResponse.json({
         success: true,
         output: {
           content: result.content,
-          name: result.filePath.split('/').pop() || 'unknown',
+          name: displayName,
           fileType: result.metadata?.fileType || 'application/octet-stream',
           size: result.metadata?.size || 0,
-          binary: false, // We only return text content
+          binary: false,
         },
+        filePath: result.filePath,
+        viewerUrl: result.viewerUrl,
       })
     }
 
@@ -156,8 +191,9 @@ export async function POST(request: NextRequest) {
  */
 async function parseFileSingle(
   filePath: string,
-  fileType?: string,
-  workspaceId?: string
+  fileType: string,
+  workspaceId: string,
+  userId: string
 ): Promise<ParseResult> {
   logger.info('Parsing file:', filePath)
 
@@ -178,18 +214,19 @@ async function parseFileSingle(
     }
   }
 
+  if (filePath.includes('/api/files/serve/')) {
+    return handleCloudFile(filePath, fileType, undefined, userId)
+  }
+
   if (filePath.startsWith('http://') || filePath.startsWith('https://')) {
-    return handleExternalUrl(filePath, fileType, workspaceId)
+    return handleExternalUrl(filePath, fileType, workspaceId, userId)
   }
 
-  const isS3Path = filePath.includes('/api/files/serve/s3/')
-  const isBlobPath = filePath.includes('/api/files/serve/blob/')
-
-  if (isS3Path || isBlobPath || isUsingCloudStorage()) {
-    return handleCloudFile(filePath, fileType)
+  if (isUsingCloudStorage()) {
+    return handleCloudFile(filePath, fileType, undefined, userId)
   }
 
-  return handleLocalFile(filePath, fileType)
+  return handleLocalFile(filePath, fileType, userId)
 }
 
 /**
@@ -225,8 +262,9 @@ function validateFilePath(filePath: string): { isValid: boolean; error?: string 
  */
 async function handleExternalUrl(
   url: string,
-  fileType?: string,
-  workspaceId?: string
+  fileType: string,
+  workspaceId: string,
+  userId: string
 ): Promise<ParseResult> {
   try {
     logger.info('Fetching external URL:', url)
@@ -242,30 +280,68 @@ async function handleExternalUrl(
       }
     }
 
-    // Extract filename from URL
     const urlPath = new URL(url).pathname
     const filename = urlPath.split('/').pop() || 'download'
     const extension = path.extname(filename).toLowerCase().substring(1)
 
     logger.info(`Extracted filename: ${filename}, workspaceId: ${workspaceId}`)
 
-    // If workspaceId provided, check if file already exists in workspace
-    if (workspaceId) {
+    const {
+      S3_EXECUTION_FILES_CONFIG,
+      BLOB_EXECUTION_FILES_CONFIG,
+      USE_S3_STORAGE,
+      USE_BLOB_STORAGE,
+    } = await import('@/lib/uploads/config')
+
+    let isExecutionFile = false
+    try {
+      const parsedUrl = new URL(url)
+
+      if (USE_S3_STORAGE && S3_EXECUTION_FILES_CONFIG.bucket) {
+        const bucketInHost = parsedUrl.hostname.startsWith(S3_EXECUTION_FILES_CONFIG.bucket)
+        const bucketInPath = parsedUrl.pathname.startsWith(`/${S3_EXECUTION_FILES_CONFIG.bucket}/`)
+        isExecutionFile = bucketInHost || bucketInPath
+      } else if (USE_BLOB_STORAGE && BLOB_EXECUTION_FILES_CONFIG.containerName) {
+        isExecutionFile = url.includes(`/${BLOB_EXECUTION_FILES_CONFIG.containerName}/`)
+      }
+    } catch (error) {
+      logger.warn('Failed to parse URL for execution file check:', error)
+      isExecutionFile = false
+    }
+
+    // Only apply workspace deduplication if:
+    // 1. WorkspaceId is provided
+    // 2. URL is NOT from execution files bucket/container
+    const shouldCheckWorkspace = workspaceId && !isExecutionFile
+
+    if (shouldCheckWorkspace) {
+      const permission = await getUserEntityPermissions(userId, 'workspace', workspaceId)
+      if (permission === null) {
+        logger.warn('User does not have workspace access for file parse', {
+          userId,
+          workspaceId,
+          filename,
+        })
+        return {
+          success: false,
+          error: 'File not found',
+          filePath: url,
+        }
+      }
+
       const { fileExistsInWorkspace, listWorkspaceFiles } = await import(
-        '@/lib/uploads/workspace-files'
+        '@/lib/uploads/contexts/workspace'
       )
       const exists = await fileExistsInWorkspace(workspaceId, filename)
 
       if (exists) {
         logger.info(`File ${filename} already exists in workspace, using existing file`)
-        // Get existing file and parse from storage
         const workspaceFiles = await listWorkspaceFiles(workspaceId)
         const existingFile = workspaceFiles.find((f) => f.name === filename)
 
         if (existingFile) {
-          // Parse from workspace storage instead of re-downloading
           const storageFilePath = `/api/files/serve/${existingFile.key}`
-          return handleCloudFile(storageFilePath, fileType)
+          return handleCloudFile(storageFilePath, fileType, 'workspace', userId)
         }
       }
     }
@@ -290,20 +366,23 @@ async function handleExternalUrl(
 
     logger.info(`Downloaded file from URL: ${url}, size: ${buffer.length} bytes`)
 
-    // If workspaceId provided, save to workspace storage
-    if (workspaceId) {
+    if (shouldCheckWorkspace) {
       try {
-        const { getSession } = await import('@/lib/auth')
-        const { uploadWorkspaceFile } = await import('@/lib/uploads/workspace-files')
-
-        const session = await getSession()
-        if (session?.user?.id) {
+        const permission = await getUserEntityPermissions(userId, 'workspace', workspaceId)
+        if (permission !== 'admin' && permission !== 'write') {
+          logger.warn('User does not have write permission for workspace file save', {
+            userId,
+            workspaceId,
+            filename,
+            permission,
+          })
+        } else {
+          const { uploadWorkspaceFile } = await import('@/lib/uploads/contexts/workspace')
           const mimeType = response.headers.get('content-type') || getMimeType(extension)
-          await uploadWorkspaceFile(workspaceId, session.user.id, buffer, filename, mimeType)
+          await uploadWorkspaceFile(workspaceId, userId, buffer, filename, mimeType)
           logger.info(`Saved URL file to workspace storage: ${filename}`)
         }
       } catch (saveError) {
-        // Log but don't fail - continue with parsing even if save fails
         logger.warn(`Failed to save URL file to workspace:`, saveError)
       }
     }
@@ -332,38 +411,105 @@ async function handleExternalUrl(
 /**
  * Handle file stored in cloud storage
  */
-async function handleCloudFile(filePath: string, fileType?: string): Promise<ParseResult> {
+async function handleCloudFile(
+  filePath: string,
+  fileType: string,
+  explicitContext: string | undefined,
+  userId: string
+): Promise<ParseResult> {
   try {
     const cloudKey = extractStorageKey(filePath)
 
     logger.info('Extracted cloud key:', cloudKey)
 
-    const fileBuffer = await downloadFile(cloudKey)
-    logger.info(`Downloaded file from cloud storage: ${cloudKey}, size: ${fileBuffer.length} bytes`)
+    const context = (explicitContext as StorageContext) || inferContextFromKey(cloudKey)
 
-    const filename = cloudKey.split('/').pop() || cloudKey
+    const hasAccess = await verifyFileAccess(
+      cloudKey,
+      userId,
+      undefined, // customConfig
+      context, // context
+      false // isLocal
+    )
+
+    if (!hasAccess) {
+      logger.warn('Unauthorized cloud file parse attempt', { userId, key: cloudKey, context })
+      return {
+        success: false,
+        error: 'File not found',
+        filePath,
+      }
+    }
+
+    let originalFilename: string | undefined
+    if (context === 'workspace') {
+      try {
+        const fileRecord = await getFileMetadataByKey(cloudKey, 'workspace')
+
+        if (fileRecord) {
+          originalFilename = fileRecord.originalName
+          logger.debug(`Found original filename for workspace file: ${originalFilename}`)
+        }
+      } catch (dbError) {
+        logger.debug(`Failed to lookup original filename for ${cloudKey}:`, dbError)
+      }
+    }
+
+    const fileBuffer = await StorageService.downloadFile({ key: cloudKey, context })
+    logger.info(
+      `Downloaded file from ${context} storage (${explicitContext ? 'explicit' : 'inferred'}): ${cloudKey}, size: ${fileBuffer.length} bytes`
+    )
+
+    const filename = originalFilename || cloudKey.split('/').pop() || cloudKey
     const extension = path.extname(filename).toLowerCase().substring(1)
 
+    const normalizedFilePath = `/api/files/serve/${encodeURIComponent(cloudKey)}?context=${context}`
+    let workspaceIdFromKey: string | undefined
+
+    if (context === 'execution') {
+      workspaceIdFromKey = extractWorkspaceIdFromExecutionKey(cloudKey) || undefined
+    } else if (context === 'workspace') {
+      const segments = cloudKey.split('/')
+      if (segments.length >= 2 && /^[a-f0-9-]{36}$/.test(segments[0])) {
+        workspaceIdFromKey = segments[0]
+      }
+    }
+
+    const viewerUrl = getViewerUrl(cloudKey, workspaceIdFromKey)
+
+    let parseResult: ParseResult
     if (extension === 'pdf') {
-      return await handlePdfBuffer(fileBuffer, filename, fileType, filePath)
+      parseResult = await handlePdfBuffer(fileBuffer, filename, fileType, normalizedFilePath)
+    } else if (extension === 'csv') {
+      parseResult = await handleCsvBuffer(fileBuffer, filename, fileType, normalizedFilePath)
+    } else if (isSupportedFileType(extension)) {
+      parseResult = await handleGenericTextBuffer(
+        fileBuffer,
+        filename,
+        extension,
+        fileType,
+        normalizedFilePath
+      )
+    } else {
+      parseResult = handleGenericBuffer(fileBuffer, filename, extension, fileType)
+      parseResult.filePath = normalizedFilePath
     }
-    if (extension === 'csv') {
-      return await handleCsvBuffer(fileBuffer, filename, fileType, filePath)
+
+    if (originalFilename) {
+      parseResult.originalName = originalFilename
     }
-    if (isSupportedFileType(extension)) {
-      return await handleGenericTextBuffer(fileBuffer, filename, extension, fileType, filePath)
-    }
-    return handleGenericBuffer(fileBuffer, filename, extension, fileType)
+
+    parseResult.viewerUrl = viewerUrl
+
+    return parseResult
   } catch (error) {
     logger.error(`Error handling cloud file ${filePath}:`, error)
 
-    // For download/access errors, throw to trigger 500 response
     const errorMessage = (error as Error).message
     if (errorMessage.includes('Access denied') || errorMessage.includes('Forbidden')) {
       throw new Error(`Error accessing file from cloud storage: ${errorMessage}`)
     }
 
-    // For other errors (parsing, processing), return success:false and an error message
     return {
       success: false,
       error: `Error accessing file from cloud storage: ${errorMessage}`,
@@ -375,9 +521,32 @@ async function handleCloudFile(filePath: string, fileType?: string): Promise<Par
 /**
  * Handle local file
  */
-async function handleLocalFile(filePath: string, fileType?: string): Promise<ParseResult> {
+async function handleLocalFile(
+  filePath: string,
+  fileType: string,
+  userId: string
+): Promise<ParseResult> {
   try {
     const filename = filePath.split('/').pop() || filePath
+
+    const context = inferContextFromKey(filename)
+    const hasAccess = await verifyFileAccess(
+      filename,
+      userId,
+      undefined, // customConfig
+      context, // context
+      true // isLocal
+    )
+
+    if (!hasAccess) {
+      logger.warn('Unauthorized local file parse attempt', { userId, filename })
+      return {
+        success: false,
+        error: 'File not found',
+        filePath,
+      }
+    }
+
     const fullPath = path.join(UPLOAD_DIR_SERVER, filename)
 
     logger.info('Processing local file:', fullPath)
@@ -641,11 +810,7 @@ function prettySize(bytes: number): string {
  * Create a formatted message for PDF content
  */
 function createPdfFallbackMessage(pageCount: number, size: number, path?: string): string {
-  const formattedPath = path
-    ? path.includes('/api/files/serve/s3/')
-      ? `S3 path: ${decodeURIComponent(path.split('/api/files/serve/s3/')[1])}`
-      : `Local path: ${path}`
-    : 'Unknown path'
+  const formattedPath = path || 'Unknown path'
 
   return `PDF document - ${pageCount} page(s), ${prettySize(size)}
 Path: ${formattedPath}
@@ -663,12 +828,8 @@ function createPdfFailureMessage(
   path: string,
   error: string
 ): string {
-  const formattedPath = path.includes('/api/files/serve/s3/')
-    ? `S3 path: ${decodeURIComponent(path.split('/api/files/serve/s3/')[1])}`
-    : `Local path: ${path}`
-
   return `PDF document - Processing failed, ${prettySize(size)}
-Path: ${formattedPath}
+Path: ${path}
 Error: ${error}
 
 This file appears to be a PDF document that could not be processed.

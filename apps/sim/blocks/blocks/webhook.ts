@@ -41,6 +41,7 @@ export const WebhookBlock: BlockConfig = {
   category: 'triggers',
   icon: WebhookIcon,
   bgColor: '#10B981', // Green color for triggers
+  docsLink: 'https://docs.sim.ai/triggers/webhook',
   triggerAllowed: true,
   hideFromToolbar: true, // Hidden for backwards compatibility - use generic webhook trigger instead
 
@@ -49,7 +50,6 @@ export const WebhookBlock: BlockConfig = {
       id: 'webhookProvider',
       title: 'Webhook Provider',
       type: 'dropdown',
-      layout: 'full',
       options: [
         'slack',
         'gmail',
@@ -90,8 +90,6 @@ export const WebhookBlock: BlockConfig = {
       id: 'gmailCredential',
       title: 'Gmail Account',
       type: 'oauth-input',
-      layout: 'full',
-      provider: 'google-email',
       serviceId: 'gmail',
       requiredScopes: [
         'https://www.googleapis.com/auth/gmail.modify',
@@ -105,8 +103,6 @@ export const WebhookBlock: BlockConfig = {
       id: 'outlookCredential',
       title: 'Microsoft Account',
       type: 'oauth-input',
-      layout: 'full',
-      provider: 'outlook',
       serviceId: 'outlook',
       requiredScopes: [
         'Mail.ReadWrite',
@@ -123,7 +119,6 @@ export const WebhookBlock: BlockConfig = {
       id: 'webhookConfig',
       title: 'Webhook Configuration',
       type: 'webhook-config',
-      layout: 'full',
     },
   ],
 

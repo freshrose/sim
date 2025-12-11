@@ -1,5 +1,5 @@
+import { getBaseUrl } from '@/lib/core/utils/urls'
 import { createLogger } from '@/lib/logs/console/logger'
-import { getBaseUrl } from '@/lib/urls/utils'
 import type { MistralParserInput, MistralParserOutput } from '@/tools/mistral/types'
 import type { ToolConfig } from '@/tools/types'
 
@@ -122,10 +122,16 @@ export const mistralParserTool: ToolConfig<MistralParserInput, MistralParserOutp
         throw new Error('Missing or invalid file path: Please provide a URL to a PDF document')
       }
 
-      // Validate and normalize URL
+      let filePathToValidate = params.filePath.trim()
+      if (filePathToValidate.startsWith('/')) {
+        const baseUrl = getBaseUrl()
+        if (!baseUrl) throw new Error('Failed to get base URL for file path conversion')
+        filePathToValidate = `${baseUrl}${filePathToValidate}`
+      }
+
       let url
       try {
-        url = new URL(params.filePath.trim())
+        url = new URL(filePathToValidate)
 
         // Validate protocol
         if (!['http:', 'https:'].includes(url.protocol)) {

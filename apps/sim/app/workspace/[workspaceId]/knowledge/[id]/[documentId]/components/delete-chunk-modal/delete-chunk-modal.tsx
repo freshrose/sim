@@ -1,17 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { Loader2, Trash2 } from 'lucide-react'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { Button, Modal, ModalBody, ModalContent, ModalFooter, ModalHeader } from '@/components/emcn'
 import { createLogger } from '@/lib/logs/console/logger'
 import type { ChunkData } from '@/stores/knowledge/store'
 
@@ -75,35 +65,29 @@ export function DeleteChunkModal({
   if (!chunk) return null
 
   return (
-    <AlertDialog open={isOpen} onOpenChange={onClose}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Delete Chunk</AlertDialogTitle>
-          <AlertDialogDescription>
-            Are you sure you want to delete this chunk? This action cannot be undone.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
-          <AlertDialogAction
+    <Modal open={isOpen} onOpenChange={onClose}>
+      <ModalContent size='sm'>
+        <ModalHeader>Delete Chunk</ModalHeader>
+        <ModalBody>
+          <p className='text-[12px] text-[var(--text-tertiary)]'>
+            Are you sure you want to delete this chunk?{' '}
+            <span className='text-[var(--text-error)]'>This action cannot be undone.</span>
+          </p>
+        </ModalBody>
+        <ModalFooter>
+          <Button variant='active' disabled={isDeleting} onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant='primary'
             onClick={handleDeleteChunk}
             disabled={isDeleting}
-            className='bg-destructive text-destructive-foreground hover:bg-destructive/90'
+            className='!bg-[var(--text-error)] !text-white hover:!bg-[var(--text-error)]/90'
           >
-            {isDeleting ? (
-              <>
-                <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-                Deleting...
-              </>
-            ) : (
-              <>
-                <Trash2 className='mr-2 h-4 w-4' />
-                Delete
-              </>
-            )}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+            {isDeleting ? <>Deleting...</> : <>Delete</>}
+          </Button>
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
   )
 }

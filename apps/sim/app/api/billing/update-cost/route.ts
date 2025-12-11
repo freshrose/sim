@@ -5,9 +5,9 @@ import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { checkAndBillOverageThreshold } from '@/lib/billing/threshold-billing'
 import { checkInternalApiKey } from '@/lib/copilot/utils'
-import { isBillingEnabled } from '@/lib/environment'
+import { isBillingEnabled } from '@/lib/core/config/environment'
+import { generateRequestId } from '@/lib/core/utils/request'
 import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
 
 const logger = createLogger('BillingUpdateCostAPI')
 
@@ -53,7 +53,6 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // Parse and validate request body
     const body = await req.json()
     const validation = UpdateCostSchema.safeParse(body)
 
@@ -91,12 +90,12 @@ export async function POST(req: NextRequest) {
       )
       return NextResponse.json({ error: 'User stats record not found' }, { status: 500 })
     }
-    // Update existing user stats record
+
     const updateFields = {
       totalCost: sql`total_cost + ${cost}`,
       currentPeriodCost: sql`current_period_cost + ${cost}`,
-      // Copilot usage tracking increments
       totalCopilotCost: sql`total_copilot_cost + ${cost}`,
+      currentPeriodCopilotCost: sql`current_period_copilot_cost + ${cost}`,
       totalCopilotCalls: sql`total_copilot_calls + 1`,
       lastActive: new Date(),
     }

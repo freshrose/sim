@@ -1,9 +1,9 @@
 import { createLogger } from '@/lib/logs/console/logger'
 import { createMcpToolId } from '@/lib/mcp/utils'
-import { getBaseUrl } from '@/lib/urls/utils'
 import { getAllBlocks } from '@/blocks'
 import type { BlockOutput } from '@/blocks/types'
-import { BlockType } from '@/executor/consts'
+import { AGENT, BlockType, DEFAULTS, HTTP } from '@/executor/constants'
+import { memoryService } from '@/executor/handlers/agent/memory'
 import type {
   AgentInputs,
   Message,
@@ -11,6 +11,9 @@ import type {
   ToolInput,
 } from '@/executor/handlers/agent/types'
 import type { BlockHandler, ExecutionContext, StreamingExecution } from '@/executor/types'
+import { collectBlockData } from '@/executor/utils/block-data'
+import { buildAPIUrl, buildAuthHeaders, extractAPIErrorMessage } from '@/executor/utils/http'
+import { stringifyJSON } from '@/executor/utils/json'
 import { executeProviderRequest } from '@/providers'
 import { getApiKey, getProviderFromModel, transformBlockTool } from '@/providers/utils'
 import type { SerializedBlock } from '@/serializer/types'
@@ -18,38 +21,6 @@ import { executeTool } from '@/tools'
 import { getTool, getToolAsync } from '@/tools/utils'
 
 const logger = createLogger('AgentBlockHandler')
-
-const DEFAULT_MODEL = 'gpt-4o'
-const DEFAULT_FUNCTION_TIMEOUT = 5000
-const REQUEST_TIMEOUT = 120000
-const CUSTOM_TOOL_PREFIX = 'custom_'
-
-/**
- * Helper function to collect runtime block outputs and name mappings
- * for tag resolution in custom tools and prompts
- */
-function collectBlockData(context: ExecutionContext): {
-  blockData: Record<string, any>
-  blockNameMapping: Record<string, string>
-} {
-  const blockData: Record<string, any> = {}
-  const blockNameMapping: Record<string, string> = {}
-
-  for (const [id, state] of context.blockStates.entries()) {
-    if (state.output !== undefined) {
-      blockData[id] = state.output
-      const workflowBlock = context.workflow?.blocks?.find((b) => b.id === id)
-      if (workflowBlock?.metadata?.name) {
-        // Map both the display name and normalized form
-        blockNameMapping[workflowBlock.metadata.name] = id
-        const normalized = workflowBlock.metadata.name.replace(/\s+/g, '').toLowerCase()
-        blockNameMapping[normalized] = id
-      }
-    }
-  }
-
-  return { blockData, blockNameMapping }
-}
 
 /**
  * Handler for Agent blocks that process LLM requests with optional tools.
@@ -60,37 +31,44 @@ export class AgentBlockHandler implements BlockHandler {
   }
 
   async execute(
+    ctx: ExecutionContext,
     block: SerializedBlock,
-    inputs: AgentInputs,
-    context: ExecutionContext
+    inputs: AgentInputs
   ): Promise<BlockOutput | StreamingExecution> {
-    logger.info(`Executing agent block: ${block.id}`)
-
     const responseFormat = this.parseResponseFormat(inputs.responseFormat)
-    const model = inputs.model || DEFAULT_MODEL
+    const model = inputs.model || AGENT.DEFAULT_MODEL
     const providerId = getProviderFromModel(model)
-    const formattedTools = await this.formatTools(inputs.tools || [], context)
-    const streamingConfig = this.getStreamingConfig(block, context)
-    const messages = this.buildMessages(inputs)
+    const formattedTools = await this.formatTools(ctx, inputs.tools || [])
+    const streamingConfig = this.getStreamingConfig(ctx, block)
+    const messages = await this.buildMessages(ctx, inputs, block.id)
 
     const providerRequest = this.buildProviderRequest({
+      ctx,
       providerId,
       model,
       messages,
       inputs,
       formattedTools,
       responseFormat,
-      context,
       streaming: streamingConfig.shouldUseStreaming ?? false,
     })
 
-    return this.executeProviderRequest(providerRequest, block, responseFormat, context)
+    const result = await this.executeProviderRequest(
+      ctx,
+      providerRequest,
+      block,
+      responseFormat,
+      inputs
+    )
+
+    await this.persistResponseToMemory(ctx, inputs, result, block.id)
+
+    return result
   }
 
   private parseResponseFormat(responseFormat?: string | object): any {
     if (!responseFormat || responseFormat === '') return undefined
 
-    // If already an object, process it directly
     if (typeof responseFormat === 'object' && responseFormat !== null) {
       const formatObj = responseFormat as any
       if (!formatObj.schema && !formatObj.name) {
@@ -103,22 +81,13 @@ export class AgentBlockHandler implements BlockHandler {
       return responseFormat
     }
 
-    // Handle string values
     if (typeof responseFormat === 'string') {
       const trimmedValue = responseFormat.trim()
 
-      // Check for variable references like <start.input>
       if (trimmedValue.startsWith('<') && trimmedValue.includes('>')) {
-        logger.info('Response format contains variable reference:', {
-          value: trimmedValue,
-        })
-        // Variable references should have been resolved by the resolver before reaching here
-        // If we still have a variable reference, it means it couldn't be resolved
-        // Return undefined to use default behavior (no structured response)
         return undefined
       }
 
-      // Try to parse as JSON
       try {
         const parsed = JSON.parse(trimmedValue)
 
@@ -135,13 +104,10 @@ export class AgentBlockHandler implements BlockHandler {
           error: error.message,
           value: trimmedValue,
         })
-        // Return undefined instead of throwing - this allows execution to continue
-        // without structured response format
         return undefined
       }
     }
 
-    // For any other type, return undefined
     logger.warn('Unexpected response format type, using default behavior:', {
       type: typeof responseFormat,
       value: responseFormat,
@@ -149,85 +115,112 @@ export class AgentBlockHandler implements BlockHandler {
     return undefined
   }
 
-  private async formatTools(inputTools: ToolInput[], context: ExecutionContext): Promise<any[]> {
+  private async formatTools(ctx: ExecutionContext, inputTools: ToolInput[]): Promise<any[]> {
     if (!Array.isArray(inputTools)) return []
 
-    const tools = await Promise.all(
-      inputTools
-        .filter((tool) => {
-          const usageControl = tool.usageControl || 'auto'
-          return usageControl !== 'none'
-        })
-        .map(async (tool) => {
-          try {
-            if (tool.type === 'custom-tool' && tool.schema) {
-              return await this.createCustomTool(tool, context)
-            }
-            if (tool.type === 'mcp') {
-              return await this.createMcpTool(tool, context)
-            }
-            return this.transformBlockTool(tool, context)
-          } catch (error) {
-            logger.error(`[AgentHandler] Error creating tool:`, { tool, error })
-            return null
+    const filtered = inputTools.filter((tool) => {
+      const usageControl = tool.usageControl || 'auto'
+      return usageControl !== 'none'
+    })
+
+    const mcpTools: ToolInput[] = []
+    const otherTools: ToolInput[] = []
+
+    for (const tool of filtered) {
+      if (tool.type === 'mcp') {
+        mcpTools.push(tool)
+      } else {
+        otherTools.push(tool)
+      }
+    }
+
+    const otherResults = await Promise.all(
+      otherTools.map(async (tool) => {
+        try {
+          if (tool.type === 'custom-tool' && (tool.schema || tool.customToolId)) {
+            return await this.createCustomTool(ctx, tool)
           }
-        })
+          return this.transformBlockTool(ctx, tool)
+        } catch (error) {
+          logger.error(`[AgentHandler] Error creating tool:`, { tool, error })
+          return null
+        }
+      })
     )
 
-    const filteredTools = tools.filter(
+    const mcpResults = await this.processMcpToolsBatched(ctx, mcpTools)
+
+    const allTools = [...otherResults, ...mcpResults]
+    return allTools.filter(
       (tool): tool is NonNullable<typeof tool> => tool !== null && tool !== undefined
     )
-
-    return filteredTools
   }
 
-  private async createCustomTool(tool: ToolInput, context: ExecutionContext): Promise<any> {
+  private async createCustomTool(ctx: ExecutionContext, tool: ToolInput): Promise<any> {
     const userProvidedParams = tool.params || {}
+
+    let schema = tool.schema
+    let code = tool.code
+    let title = tool.title
+
+    if (tool.customToolId && !schema) {
+      const resolved = await this.fetchCustomToolById(ctx, tool.customToolId)
+      if (!resolved) {
+        logger.error(`Custom tool not found: ${tool.customToolId}`)
+        return null
+      }
+      schema = resolved.schema
+      code = resolved.code
+      title = resolved.title
+    }
+
+    if (!schema?.function) {
+      logger.error('Custom tool missing schema:', { customToolId: tool.customToolId, title })
+      return null
+    }
 
     const { filterSchemaForLLM, mergeToolParameters } = await import('@/tools/params')
 
-    const filteredSchema = filterSchemaForLLM(tool.schema.function.parameters, userProvidedParams)
+    const filteredSchema = filterSchemaForLLM(schema.function.parameters, userProvidedParams)
 
-    const toolId = `${CUSTOM_TOOL_PREFIX}${tool.title}`
+    const toolId = `${AGENT.CUSTOM_TOOL_PREFIX}${title}`
     const base: any = {
       id: toolId,
-      name: tool.schema.function.name,
-      description: tool.schema.function.description || '',
+      name: schema.function.name,
+      description: schema.function.description || '',
       params: userProvidedParams,
       parameters: {
         ...filteredSchema,
-        type: tool.schema.function.parameters.type,
+        type: schema.function.parameters.type,
       },
       usageControl: tool.usageControl || 'auto',
     }
 
-    if (tool.code) {
+    if (code) {
       base.executeFunction = async (callParams: Record<string, any>) => {
-        // Merge user-provided parameters with LLM-generated parameters
         const mergedParams = mergeToolParameters(userProvidedParams, callParams)
 
-        // Collect block outputs for tag resolution
-        const { blockData, blockNameMapping } = collectBlockData(context)
+        const { blockData, blockNameMapping } = collectBlockData(ctx)
 
         const result = await executeTool(
           'function_execute',
           {
-            code: tool.code,
+            code,
             ...mergedParams,
-            timeout: tool.timeout ?? DEFAULT_FUNCTION_TIMEOUT,
-            envVars: context.environmentVariables || {},
-            workflowVariables: context.workflowVariables || {},
+            timeout: tool.timeout ?? AGENT.DEFAULT_FUNCTION_TIMEOUT,
+            envVars: ctx.environmentVariables || {},
+            workflowVariables: ctx.workflowVariables || {},
             blockData,
             blockNameMapping,
             isCustomTool: true,
             _context: {
-              workflowId: context.workflowId,
-              workspaceId: context.workspaceId,
+              workflowId: ctx.workflowId,
+              workspaceId: ctx.workspaceId,
             },
           },
-          false, // skipProxy
-          false, // skipPostProcess
-          context // execution context for file processing
+          false,
+          false,
+          ctx
         )
 
         if (!result.success) {
@@ -240,127 +233,378 @@ export class AgentBlockHandler implements BlockHandler {
     return base
   }
 
-  private async createMcpTool(tool: ToolInput, context: ExecutionContext): Promise<any> {
-    const { serverId, toolName, params } = tool.params || {}
-
-    if (!serverId || !toolName) {
-      logger.error('MCP tool missing required parameters:', { serverId, toolName })
-      return null
+  /**
+   * Fetches a custom tool definition from the database by ID
+   */
+  private async fetchCustomToolById(
+    ctx: ExecutionContext,
+    customToolId: string
+  ): Promise<{ schema: any; code: string; title: string } | null> {
+    if (typeof window !== 'undefined') {
+      try {
+        const { useCustomToolsStore } = await import('@/stores/custom-tools/store')
+        const tool = useCustomToolsStore.getState().getTool(customToolId)
+        if (tool) {
+          return {
+            schema: tool.schema,
+            code: tool.code || '',
+            title: tool.title,
+          }
+        }
+        logger.warn(`Custom tool not found in store: ${customToolId}`)
+      } catch (error) {
+        logger.error('Error accessing custom tools store:', { error })
+      }
     }
 
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      const headers = await buildAuthHeaders()
+      const params: Record<string, string> = {}
 
-      if (typeof window === 'undefined') {
-        try {
-          const { generateInternalToken } = await import('@/lib/auth/internal')
-          const internalToken = await generateInternalToken()
-          headers.Authorization = `Bearer ${internalToken}`
-        } catch (error) {
-          logger.error(`Failed to generate internal token for MCP tool discovery:`, error)
-        }
+      if (ctx.workspaceId) {
+        params.workspaceId = ctx.workspaceId
+      }
+      if (ctx.workflowId) {
+        params.workflowId = ctx.workflowId
       }
 
-      const url = new URL('/api/mcp/tools/discover', getBaseUrl())
-      url.searchParams.set('serverId', serverId)
-      if (context.workspaceId) {
-        url.searchParams.set('workspaceId', context.workspaceId)
-      } else {
-        throw new Error('workspaceId is required for MCP tool discovery')
-      }
-      if (context.workflowId) {
-        url.searchParams.set('workflowId', context.workflowId)
-      } else {
-        throw new Error('workflowId is required for internal JWT authentication')
-      }
-
+      const url = buildAPIUrl('/api/tools/custom', params)
       const response = await fetch(url.toString(), {
         method: 'GET',
         headers,
       })
+
       if (!response.ok) {
-        throw new Error(`Failed to discover tools from server ${serverId}`)
+        logger.error(`Failed to fetch custom tools: ${response.status}`)
+        return null
       }
 
       const data = await response.json()
-      if (!data.success) {
-        throw new Error(data.error || 'Failed to discover MCP tools')
+      if (!data.data || !Array.isArray(data.data)) {
+        logger.error('Invalid custom tools API response')
+        return null
       }
 
-      const mcpTool = data.data.tools.find((t: any) => t.name === toolName)
-      if (!mcpTool) {
-        throw new Error(`MCP tool ${toolName} not found on server ${serverId}`)
+      const tool = data.data.find((t: any) => t.id === customToolId)
+      if (!tool) {
+        logger.warn(`Custom tool not found by ID: ${customToolId}`)
+        return null
       }
-
-      const toolId = createMcpToolId(serverId, toolName)
 
       return {
-        id: toolId,
-        name: toolName,
-        description: mcpTool.description || `MCP tool ${toolName} from ${mcpTool.serverName}`,
-        parameters: mcpTool.inputSchema || { type: 'object', properties: {} },
-        usageControl: tool.usageControl || 'auto',
-        executeFunction: async (callParams: Record<string, any>) => {
-          logger.info(`Executing MCP tool ${toolName} on server ${serverId}`)
-
-          const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-
-          if (typeof window === 'undefined') {
-            try {
-              const { generateInternalToken } = await import('@/lib/auth/internal')
-              const internalToken = await generateInternalToken()
-              headers.Authorization = `Bearer ${internalToken}`
-            } catch (error) {
-              logger.error(`Failed to generate internal token for MCP tool ${toolName}:`, error)
-            }
-          }
-
-          const execResponse = await fetch(`${getBaseUrl()}/api/mcp/tools/execute`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              serverId,
-              toolName,
-              arguments: { ...params, ...callParams },
-              workspaceId: context.workspaceId,
-              workflowId: context.workflowId,
-            }),
-          })
-
-          if (!execResponse.ok) {
-            throw new Error(
-              `MCP tool execution failed: ${execResponse.status} ${execResponse.statusText}`
-            )
-          }
-
-          const result = await execResponse.json()
-          if (!result.success) {
-            throw new Error(result.error || 'MCP tool execution failed')
-          }
-
-          return {
-            success: true,
-            output: result.data.output || {},
-            metadata: {
-              source: 'mcp',
-              serverId,
-              serverName: mcpTool.serverName,
-              toolName,
-            },
-          }
-        },
+        schema: tool.schema,
+        code: tool.code || '',
+        title: tool.title,
       }
     } catch (error) {
-      logger.error(`Failed to create MCP tool ${toolName} from server ${serverId}:`, error)
+      logger.error('Error fetching custom tool:', { customToolId, error })
       return null
     }
   }
 
-  private async transformBlockTool(tool: ToolInput, context: ExecutionContext) {
+  /**
+   * Process MCP tools using cached schemas from build time.
+   */
+  private async processMcpToolsBatched(
+    ctx: ExecutionContext,
+    mcpTools: ToolInput[]
+  ): Promise<any[]> {
+    if (mcpTools.length === 0) return []
+
+    const results: any[] = []
+
+    const toolsWithSchema: ToolInput[] = []
+    const toolsNeedingDiscovery: ToolInput[] = []
+
+    for (const tool of mcpTools) {
+      const serverId = tool.params?.serverId
+      const toolName = tool.params?.toolName
+
+      if (!serverId || !toolName) {
+        logger.error('MCP tool missing serverId or toolName:', tool)
+        continue
+      }
+
+      if (tool.schema) {
+        toolsWithSchema.push(tool)
+      } else {
+        logger.warn(`MCP tool ${toolName} missing cached schema, will need discovery`)
+        toolsNeedingDiscovery.push(tool)
+      }
+    }
+
+    for (const tool of toolsWithSchema) {
+      try {
+        const created = await this.createMcpToolFromCachedSchema(ctx, tool)
+        if (created) results.push(created)
+      } catch (error) {
+        logger.error(`Error creating MCP tool from cached schema:`, { tool, error })
+      }
+    }
+
+    if (toolsNeedingDiscovery.length > 0) {
+      const discoveredResults = await this.processMcpToolsWithDiscovery(ctx, toolsNeedingDiscovery)
+      results.push(...discoveredResults)
+    }
+
+    return results
+  }
+
+  /**
+   * Create MCP tool from cached schema. No MCP server connection required.
+   */
+  private async createMcpToolFromCachedSchema(
+    ctx: ExecutionContext,
+    tool: ToolInput
+  ): Promise<any> {
+    const { serverId, toolName, serverName, ...userProvidedParams } = tool.params || {}
+
+    const { filterSchemaForLLM } = await import('@/tools/params')
+    const filteredSchema = filterSchemaForLLM(
+      tool.schema || { type: 'object', properties: {} },
+      userProvidedParams
+    )
+
+    const toolId = createMcpToolId(serverId, toolName)
+
+    return {
+      id: toolId,
+      name: toolName,
+      description:
+        tool.schema?.description || `MCP tool ${toolName} from ${serverName || serverId}`,
+      parameters: filteredSchema,
+      params: userProvidedParams,
+      usageControl: tool.usageControl || 'auto',
+      executeFunction: async (callParams: Record<string, any>) => {
+        const headers = await buildAuthHeaders()
+        const execUrl = buildAPIUrl('/api/mcp/tools/execute')
+
+        const execResponse = await fetch(execUrl.toString(), {
+          method: 'POST',
+          headers,
+          body: stringifyJSON({
+            serverId,
+            toolName,
+            arguments: callParams,
+            workspaceId: ctx.workspaceId,
+            workflowId: ctx.workflowId,
+            toolSchema: tool.schema,
+          }),
+        })
+
+        if (!execResponse.ok) {
+          throw new Error(
+            `MCP tool execution failed: ${execResponse.status} ${execResponse.statusText}`
+          )
+        }
+
+        const result = await execResponse.json()
+        if (!result.success) {
+          throw new Error(result.error || 'MCP tool execution failed')
+        }
+
+        return {
+          success: true,
+          output: result.data.output || {},
+          metadata: {
+            source: 'mcp',
+            serverId,
+            serverName: serverName || serverId,
+            toolName,
+          },
+        }
+      },
+    }
+  }
+
+  /**
+   * Fallback for legacy tools without cached schemas. Groups by server to minimize connections.
+   */
+  private async processMcpToolsWithDiscovery(
+    ctx: ExecutionContext,
+    mcpTools: ToolInput[]
+  ): Promise<any[]> {
+    const toolsByServer = new Map<string, ToolInput[]>()
+    for (const tool of mcpTools) {
+      const serverId = tool.params?.serverId
+      if (!toolsByServer.has(serverId)) {
+        toolsByServer.set(serverId, [])
+      }
+      toolsByServer.get(serverId)!.push(tool)
+    }
+
+    const serverDiscoveryResults = await Promise.all(
+      Array.from(toolsByServer.entries()).map(async ([serverId, tools]) => {
+        try {
+          const discoveredTools = await this.discoverMcpToolsForServer(ctx, serverId)
+          return { serverId, tools, discoveredTools, error: null as Error | null }
+        } catch (error) {
+          logger.error(`Failed to discover tools from server ${serverId}:`, error)
+          return { serverId, tools, discoveredTools: [] as any[], error: error as Error }
+        }
+      })
+    )
+
+    const results: any[] = []
+    for (const { serverId, tools, discoveredTools, error } of serverDiscoveryResults) {
+      if (error) continue
+
+      for (const tool of tools) {
+        try {
+          const toolName = tool.params?.toolName
+          const mcpTool = discoveredTools.find((t: any) => t.name === toolName)
+
+          if (!mcpTool) {
+            logger.error(`MCP tool ${toolName} not found on server ${serverId}`)
+            continue
+          }
+
+          const created = await this.createMcpToolFromDiscoveredData(ctx, tool, mcpTool, serverId)
+          if (created) results.push(created)
+        } catch (error) {
+          logger.error(`Error creating MCP tool:`, { tool, error })
+        }
+      }
+    }
+
+    return results
+  }
+
+  /**
+   * Discover tools from a single MCP server with retry logic.
+   */
+  private async discoverMcpToolsForServer(ctx: ExecutionContext, serverId: string): Promise<any[]> {
+    if (!ctx.workspaceId) {
+      throw new Error('workspaceId is required for MCP tool discovery')
+    }
+    if (!ctx.workflowId) {
+      throw new Error('workflowId is required for internal JWT authentication')
+    }
+
+    const headers = await buildAuthHeaders()
+    const url = buildAPIUrl('/api/mcp/tools/discover', {
+      serverId,
+      workspaceId: ctx.workspaceId,
+      workflowId: ctx.workflowId,
+    })
+
+    const maxAttempts = 2
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const response = await fetch(url.toString(), { method: 'GET', headers })
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          if (this.isRetryableError(errorText) && attempt < maxAttempts - 1) {
+            logger.warn(
+              `[AgentHandler] Session error discovering tools from ${serverId}, retrying (attempt ${attempt + 1})`
+            )
+            await new Promise((r) => setTimeout(r, 100))
+            continue
+          }
+          throw new Error(`Failed to discover tools: ${response.status} ${errorText}`)
+        }
+
+        const data = await response.json()
+        if (!data.success) {
+          throw new Error(data.error || 'Failed to discover MCP tools')
+        }
+
+        return data.data.tools
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error)
+        if (this.isRetryableError(errorMsg) && attempt < maxAttempts - 1) {
+          logger.warn(
+            `[AgentHandler] Retryable error discovering tools from ${serverId} (attempt ${attempt + 1}):`,
+            error
+          )
+          await new Promise((r) => setTimeout(r, 100))
+          continue
+        }
+        throw error
+      }
+    }
+
+    throw new Error(
+      `Failed to discover tools from server ${serverId} after ${maxAttempts} attempts`
+    )
+  }
+
+  private isRetryableError(errorMsg: string): boolean {
+    const lowerMsg = errorMsg.toLowerCase()
+    return lowerMsg.includes('session') || lowerMsg.includes('400') || lowerMsg.includes('404')
+  }
+
+  private async createMcpToolFromDiscoveredData(
+    ctx: ExecutionContext,
+    tool: ToolInput,
+    mcpTool: any,
+    serverId: string
+  ): Promise<any> {
+    const { toolName, ...userProvidedParams } = tool.params || {}
+
+    const { filterSchemaForLLM } = await import('@/tools/params')
+    const filteredSchema = filterSchemaForLLM(
+      mcpTool.inputSchema || { type: 'object', properties: {} },
+      userProvidedParams
+    )
+
+    const toolId = createMcpToolId(serverId, toolName)
+
+    return {
+      id: toolId,
+      name: toolName,
+      description: mcpTool.description || `MCP tool ${toolName} from ${mcpTool.serverName}`,
+      parameters: filteredSchema,
+      params: userProvidedParams,
+      usageControl: tool.usageControl || 'auto',
+      executeFunction: async (callParams: Record<string, any>) => {
+        const headers = await buildAuthHeaders()
+        const execUrl = buildAPIUrl('/api/mcp/tools/execute')
+
+        const execResponse = await fetch(execUrl.toString(), {
+          method: 'POST',
+          headers,
+          body: stringifyJSON({
+            serverId,
+            toolName,
+            arguments: callParams,
+            workspaceId: ctx.workspaceId,
+            workflowId: ctx.workflowId,
+            toolSchema: mcpTool.inputSchema,
+          }),
+        })
+
+        if (!execResponse.ok) {
+          throw new Error(
+            `MCP tool execution failed: ${execResponse.status} ${execResponse.statusText}`
+          )
+        }
+
+        const result = await execResponse.json()
+        if (!result.success) {
+          throw new Error(result.error || 'MCP tool execution failed')
+        }
+
+        return {
+          success: true,
+          output: result.data.output || {},
+          metadata: {
+            source: 'mcp',
+            serverId,
+            serverName: mcpTool.serverName,
+            toolName,
+          },
+        }
+      },
+    }
+  }
+
+  private async transformBlockTool(ctx: ExecutionContext, tool: ToolInput) {
     const transformedTool = await transformBlockTool(tool, {
       selectedOperation: tool.operation,
       getAllBlocks,
-      getToolAsync: (toolId: string) => getToolAsync(toolId, context.workflowId),
+      getToolAsync: (toolId: string) => getToolAsync(toolId, ctx.workflowId),
       getTool,
     })
 
@@ -370,9 +614,9 @@ export class AgentBlockHandler implements BlockHandler {
     return transformedTool
   }
 
-  private getStreamingConfig(block: SerializedBlock, context: ExecutionContext): StreamingConfig {
+  private getStreamingConfig(ctx: ExecutionContext, block: SerializedBlock): StreamingConfig {
     const isBlockSelectedForOutput =
-      context.selectedOutputs?.some((outputId) => {
+      ctx.selectedOutputs?.some((outputId) => {
         if (outputId === block.id) return true
         const firstUnderscoreIndex = outputId.indexOf('_')
         return (
@@ -380,31 +624,86 @@ export class AgentBlockHandler implements BlockHandler {
         )
       }) ?? false
 
-    const hasOutgoingConnections = context.edges?.some((edge) => edge.source === block.id) ?? false
-    const shouldUseStreaming = Boolean(context.stream) && isBlockSelectedForOutput
+    const hasOutgoingConnections = ctx.edges?.some((edge) => edge.source === block.id) ?? false
+    const shouldUseStreaming = Boolean(ctx.stream) && isBlockSelectedForOutput
 
     return { shouldUseStreaming, isBlockSelectedForOutput, hasOutgoingConnections }
   }
 
-  private buildMessages(inputs: AgentInputs): Message[] | undefined {
-    if (!inputs.memories && !(inputs.systemPrompt && inputs.userPrompt)) {
-      return undefined
-    }
-
+  private async buildMessages(
+    ctx: ExecutionContext,
+    inputs: AgentInputs,
+    blockId: string
+  ): Promise<Message[] | undefined> {
     const messages: Message[] = []
 
+    // 1. Fetch memory history if configured (industry standard: chronological order)
+    if (inputs.memoryType && inputs.memoryType !== 'none') {
+      const memoryMessages = await memoryService.fetchMemoryMessages(ctx, inputs, blockId)
+      messages.push(...memoryMessages)
+    }
+
+    // 2. Process legacy memories (backward compatibility - from Memory block)
     if (inputs.memories) {
       messages.push(...this.processMemories(inputs.memories))
     }
 
-    if (inputs.systemPrompt) {
+    // 3. Add messages array (new approach - from messages-input subblock)
+    if (inputs.messages && Array.isArray(inputs.messages)) {
+      const validMessages = inputs.messages.filter(
+        (msg) =>
+          msg &&
+          typeof msg === 'object' &&
+          'role' in msg &&
+          'content' in msg &&
+          ['system', 'user', 'assistant'].includes(msg.role)
+      )
+      messages.push(...validMessages)
+    }
+
+    // Warn if using both new and legacy input formats
+    if (
+      inputs.messages &&
+      inputs.messages.length > 0 &&
+      (inputs.systemPrompt || inputs.userPrompt)
+    ) {
+      logger.warn('Agent block using both messages array and legacy prompts', {
+        hasMessages: true,
+        hasSystemPrompt: !!inputs.systemPrompt,
+        hasUserPrompt: !!inputs.userPrompt,
+      })
+    }
+
+    // 4. Handle legacy systemPrompt (backward compatibility)
+    // Only add if no system message exists yet
+    if (inputs.systemPrompt && !messages.some((m) => m.role === 'system')) {
       this.addSystemPrompt(messages, inputs.systemPrompt)
     }
 
+    // 5. Handle legacy userPrompt (backward compatibility)
     if (inputs.userPrompt) {
       this.addUserPrompt(messages, inputs.userPrompt)
     }
 
+    // 6. Persist user message(s) to memory if configured
+    // This ensures conversation history is complete before agent execution
+    if (inputs.memoryType && inputs.memoryType !== 'none' && messages.length > 0) {
+      // Find new user messages that need to be persisted
+      // (messages added via messages array or userPrompt)
+      const userMessages = messages.filter((m) => m.role === 'user')
+      const lastUserMessage = userMessages[userMessages.length - 1]
+
+      // Only persist if there's a user message AND it's from userPrompt or messages input
+      // (not from memory history which was already persisted)
+      if (
+        lastUserMessage &&
+        (inputs.userPrompt || (inputs.messages && inputs.messages.length > 0))
+      ) {
+        await memoryService.persistUserMessage(ctx, inputs, lastUserMessage, blockId)
+      }
+    }
+
+    // Return messages or undefined if empty (maintains API compatibility)
     return messages.length > 0 ? messages : undefined
   }
 
@@ -444,6 +743,10 @@ export class AgentBlockHandler implements BlockHandler {
     return messages
   }
 
+  /**
+   * Ensures system message is at position 0 (industry standard)
+   * Preserves existing system message if already at position 0, otherwise adds/moves it
+   */
   private addSystemPrompt(messages: Message[], systemPrompt: any) {
     let content: string
 
@@ -457,17 +760,31 @@ export class AgentBlockHandler implements BlockHandler {
       }
     }
 
-    const systemMessages = messages.filter((msg) => msg.role === 'system')
+    // Find first system message
+    const firstSystemIndex = messages.findIndex((msg) => msg.role === 'system')
 
-    if (systemMessages.length > 0) {
-      messages.splice(0, 0, { role: 'system', content })
-      for (let i = messages.length - 1; i >= 1; i--) {
-        if (messages[i].role === 'system') {
-          messages.splice(i, 1)
-        }
-      }
+    if (firstSystemIndex === -1) {
+      // No system message exists - add at position 0
+      messages.unshift({ role: 'system', content })
+    } else if (firstSystemIndex === 0) {
+      // System message already at position 0 - replace it
+      // Explicit systemPrompt parameter takes precedence over memory/messages
+      messages[0] = { role: 'system', content }
     } else {
-      messages.splice(0, 0, { role: 'system', content })
+      // System message exists but not at position 0 - move it to position 0
+      // and update with new content
+      messages.splice(firstSystemIndex, 1)
+      messages.unshift({ role: 'system', content })
+    }
+
+    // Remove any additional system messages (keep only the first one)
+    for (let i = messages.length - 1; i >= 1; i--) {
+      if (messages[i].role === 'system') {
+        messages.splice(i, 1)
+        logger.warn('Removed duplicate system message from conversation history', {
+          position: i,
+        })
+      }
     }
   }
 
@@ -485,36 +802,27 @@ export class AgentBlockHandler implements BlockHandler {
   }
 
   private buildProviderRequest(config: {
+    ctx: ExecutionContext
     providerId: string
     model: string
     messages: Message[] | undefined
     inputs: AgentInputs
     formattedTools: any[]
     responseFormat: any
-    context: ExecutionContext
     streaming: boolean
   }) {
-    const {
-      providerId,
-      model,
-      messages,
-      inputs,
-      formattedTools,
-      responseFormat,
-      context,
-      streaming,
-    } = config
+    const { ctx, providerId, model, messages, inputs, formattedTools, responseFormat, streaming } =
+      config
 
     const validMessages = this.validateMessages(messages)
 
-    // Collect block outputs for runtime resolution
-    const { blockData, blockNameMapping } = collectBlockData(context)
+    const { blockData, blockNameMapping } = collectBlockData(ctx)
 
     return {
       provider: providerId,
       model,
       systemPrompt: validMessages ? undefined : inputs.systemPrompt,
-      context: JSON.stringify(messages),
+      context: stringifyJSON(messages),
       tools: formattedTools,
       temperature: inputs.temperature,
       maxTokens: inputs.maxTokens,
@@ -522,12 +830,12 @@ export class AgentBlockHandler implements BlockHandler {
       azureEndpoint: inputs.azureEndpoint,
       azureApiVersion: inputs.azureApiVersion,
       responseFormat,
-      workflowId: context.workflowId,
-      workspaceId: context.workspaceId,
+      workflowId: ctx.workflowId,
+      workspaceId: ctx.workspaceId,
       stream: streaming,
       messages,
-      environmentVariables: context.environmentVariables || {},
-      workflowVariables: context.workflowVariables || {},
+      environmentVariables: ctx.environmentVariables || {},
+      workflowVariables: ctx.workflowVariables || {},
       blockData,
       blockNameMapping,
       reasoningEffort: inputs.reasoningEffort,
@@ -552,10 +860,11 @@ export class AgentBlockHandler implements BlockHandler {
   }
 
   private async executeProviderRequest(
+    ctx: ExecutionContext,
     providerRequest: any,
     block: SerializedBlock,
     responseFormat: any,
-    context: ExecutionContext
+    inputs: AgentInputs
   ): Promise<BlockOutput | StreamingExecution> {
     const providerId = providerRequest.provider
     const model = providerRequest.model
@@ -566,41 +875,41 @@ export class AgentBlockHandler implements BlockHandler {
 
       if (!isBrowser) {
         return this.executeServerSide(
+          ctx,
           providerRequest,
           providerId,
           model,
           block,
           responseFormat,
-          context,
           providerStartTime
         )
       }
       return this.executeBrowserSide(
+        ctx,
         providerRequest,
         block,
         responseFormat,
-        context,
-        providerStartTime
+        providerStartTime,
+        inputs
       )
     } catch (error) {
-      this.handleExecutionError(error, providerStartTime, providerId, model, context, block)
+      this.handleExecutionError(error, providerStartTime, providerId, model, ctx, block)
       throw error
     }
   }
 
   private async executeServerSide(
+    ctx: ExecutionContext,
     providerRequest: any,
     providerId: string,
     model: string,
     block: SerializedBlock,
     responseFormat: any,
-    context: ExecutionContext,
     providerStartTime: number
   ) {
     const finalApiKey = this.getApiKey(providerId, model, providerRequest.apiKey)
 
-    // Collect block outputs for runtime resolution
-    const { blockData, blockNameMapping } = collectBlockData(context)
+    const { blockData, blockNameMapping } = collectBlockData(ctx)
 
     const response = await executeProviderRequest(providerId, {
       model,
@@ -617,82 +926,90 @@ export class AgentBlockHandler implements BlockHandler {
       workspaceId: providerRequest.workspaceId,
       stream: providerRequest.stream,
       messages: 'messages' in providerRequest ? providerRequest.messages : undefined,
-      environmentVariables: context.environmentVariables || {},
-      workflowVariables: context.workflowVariables || {},
+      environmentVariables: ctx.environmentVariables || {},
+      workflowVariables: ctx.workflowVariables || {},
       blockData,
       blockNameMapping,
     })
 
-    this.logExecutionSuccess(providerId, model, context, block, providerStartTime, response)
+    this.logExecutionSuccess(providerId, model, ctx, block, providerStartTime, response)
     return this.processProviderResponse(response, block, responseFormat)
   }
 
   private async executeBrowserSide(
+    ctx: ExecutionContext,
     providerRequest: any,
     block: SerializedBlock,
     responseFormat: any,
-    context: ExecutionContext,
-    providerStartTime: number
+    providerStartTime: number,
+    inputs: AgentInputs
   ) {
-    logger.info('Using HTTP provider request (browser environment)')
-
-    const url = new URL('/api/providers', getBaseUrl())
+    const url = buildAPIUrl('/api/providers')
     const response = await fetch(url.toString(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(providerRequest),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+      headers: { 'Content-Type': HTTP.CONTENT_TYPE.JSON },
+      body: stringifyJSON(providerRequest),
+      signal: AbortSignal.timeout(AGENT.REQUEST_TIMEOUT),
     })
 
     if (!response.ok) {
-      const errorMessage = await this.extractErrorMessage(response)
+      const errorMessage = await extractAPIErrorMessage(response)
       throw new Error(errorMessage)
     }
 
     this.logExecutionSuccess(
       providerRequest.provider,
       providerRequest.model,
-      context,
+      ctx,
       block,
       providerStartTime,
       'HTTP response'
     )
 
-    // Check if this is a streaming response
     const contentType = response.headers.get('Content-Type')
-    if (contentType?.includes('text/event-stream')) {
-      // Handle streaming response
-      logger.info('Received streaming response')
-      return this.handleStreamingResponse(response, block)
+    if (contentType?.includes(HTTP.CONTENT_TYPE.EVENT_STREAM)) {
+      return this.handleStreamingResponse(response, block, ctx, inputs)
     }
 
-    // Handle regular JSON response
     const result = await response.json()
     return this.processProviderResponse(result, block, responseFormat)
   }
 
   private async handleStreamingResponse(
     response: Response,
-    block: SerializedBlock
+    block: SerializedBlock,
+    ctx?: ExecutionContext,
+    inputs?: AgentInputs
   ): Promise<StreamingExecution> {
-    // Check if we have execution data in headers (from StreamingExecution)
     const executionDataHeader = response.headers.get('X-Execution-Data')
 
     if (executionDataHeader) {
-      // Parse execution data from header
       try {
         const executionData = JSON.parse(executionDataHeader)
 
-        // Create StreamingExecution object
+        // If execution data contains full content, persist to memory
+        if (ctx && inputs && executionData.output?.content) {
+          const assistantMessage: Message = {
+            role: 'assistant',
+            content: executionData.output.content,
+          }
+          // Fire and forget - don't await
+          memoryService
+            .persistMemoryMessage(ctx, inputs, assistantMessage, block.id)
+            .catch((error) =>
+              logger.error('Failed to persist streaming response to memory:', error)
+            )
+        }
+
         return {
           stream: response.body!,
           execution: {
             success: executionData.success,
             output: executionData.output || {},
             error: executionData.error,
-            logs: [], // Logs are stripped from headers, will be populated by executor
+            logs: [],
             metadata: executionData.metadata || {
-              duration: 0,
+              duration: DEFAULTS.EXECUTION_TIME,
               startTime: new Date().toISOString(),
             },
             isStreaming: true,
@@ -703,11 +1020,9 @@ export class AgentBlockHandler implements BlockHandler {
         }
       } catch (error) {
         logger.error('Failed to parse execution data from header:', error)
-        // Fall back to minimal streaming execution
       }
     }
 
-    // Fallback for plain ReadableStream or when header parsing fails
     return this.createMinimalStreamingExecution(response.body!)
   }
 
@@ -725,23 +1040,10 @@ export class AgentBlockHandler implements BlockHandler {
     }
   }
 
-  private async extractErrorMessage(response: Response): Promise<string> {
-    let errorMessage = `Provider API request failed with status ${response.status}`
-    try {
-      const errorData = await response.json()
-      if (errorData.error) {
-        errorMessage = errorData.error
-      }
-    } catch (_e) {
-      // Use default message if JSON parsing fails
-    }
-    return errorMessage
-  }
-
   private logExecutionSuccess(
     provider: string,
     model: string,
-    context: ExecutionContext,
+    ctx: ExecutionContext,
     block: SerializedBlock,
     startTime: number,
     response: any
@@ -753,15 +1055,6 @@ export class AgentBlockHandler implements BlockHandler {
         : response && typeof response === 'object' && 'stream' in response
           ? 'streaming-execution'
           : 'json'
-
-    logger.info('Provider request completed successfully', {
-      provider,
-      model,
-      workflowId: context.workflowId,
-      blockId: block.id,
-      executionTime,
-      responseType,
-    })
   }
 
   private handleExecutionError(
@@ -769,7 +1062,7 @@ export class AgentBlockHandler implements BlockHandler {
     startTime: number,
     provider: string,
     model: string,
-    context: ExecutionContext,
+    ctx: ExecutionContext,
     block: SerializedBlock
   ) {
     const executionTime = Date.now() - startTime
@@ -779,14 +1072,14 @@ export class AgentBlockHandler implements BlockHandler {
       executionTime,
       provider,
       model,
-      workflowId: context.workflowId,
+      workflowId: ctx.workflowId,
       blockId: block.id,
     })
 
     if (!(error instanceof Error)) return
 
     logger.error('Provider request error details', {
-      workflowId: context.workflowId,
+      workflowId: ctx.workflowId,
       blockId: block.id,
       errorName: error.name,
       errorMessage: error.message,
@@ -804,6 +1097,49 @@ export class AgentBlockHandler implements BlockHandler {
     }
     if (error.message.includes('ENOTFOUND') || error.message.includes('ECONNREFUSED')) {
       throw new Error('Unable to connect to server - DNS or connection issue')
+    }
+  }
+
+  private async persistResponseToMemory(
+    ctx: ExecutionContext,
+    inputs: AgentInputs,
+    result: BlockOutput | StreamingExecution,
+    blockId: string
+  ): Promise<void> {
+    // Only persist if memoryType is configured
+    if (!inputs.memoryType || inputs.memoryType === 'none') {
+      return
+    }
+
+    try {
+      // Don't persist streaming responses here - they're handled separately
+      if (this.isStreamingExecution(result)) {
+        return
+      }
+
+      // Extract content from regular response
+      const blockOutput = result as any
+      const content = blockOutput?.content
+
+      if (!content || typeof content !== 'string') {
+        return
+      }
+
+      const assistantMessage: Message = {
+        role: 'assistant',
+        content,
+      }
+
+      await memoryService.persistMemoryMessage(ctx, inputs, assistantMessage, blockId)
+
+      logger.debug('Persisted assistant response to memory', {
+        workflowId: ctx.workflowId,
+        memoryType: inputs.memoryType,
+        conversationId: inputs.conversationId,
+      })
+    } catch (error) {
+      logger.error('Failed to persist response to memory:', error)
+      // Don't throw - memory persistence failure shouldn't break workflow execution
     }
   }
 
@@ -834,7 +1170,6 @@ export class AgentBlockHandler implements BlockHandler {
     block: SerializedBlock
   ): StreamingExecution {
     const streamingExec = response as StreamingExecution
-    logger.info(`Received StreamingExecution for block ${block.id}`)
 
     if (streamingExec.execution.output) {
       const execution = streamingExec.execution as any
@@ -855,7 +1190,7 @@ export class AgentBlockHandler implements BlockHandler {
         output: {},
         logs: [],
         metadata: {
-          duration: 0,
+          duration: DEFAULTS.EXECUTION_TIME,
           startTime: new Date().toISOString(),
         },
       },
@@ -875,17 +1210,11 @@ export class AgentBlockHandler implements BlockHandler {
 
     try {
       const extractedJson = JSON.parse(content.trim())
-      logger.info('Successfully parsed structured response content')
       return {
         ...extractedJson,
         ...this.createResponseMetadata(result),
       }
     } catch (error) {
-      logger.info('JSON parsing failed', {
-        error: error instanceof Error ? error.message : 'Unknown error',
-      })
-
-      // LLM did not adhere to structured response format
       logger.error('LLM did not adhere to structured response format:', {
         content: content.substring(0, 200) + (content.length > 200 ? '...' : ''),
         responseFormat: responseFormat,
@@ -907,12 +1236,21 @@ export class AgentBlockHandler implements BlockHandler {
     }
   }
 
-  private createResponseMetadata(result: any) {
+  private createResponseMetadata(result: {
+    tokens?: { prompt?: number; completion?: number; total?: number }
+    toolCalls?: Array<any>
+    timing?: any
+    cost?: any
+  }) {
     return {
-      tokens: result.tokens || { prompt: 0, completion: 0, total: 0 },
+      tokens: result.tokens || {
+        prompt: DEFAULTS.TOKENS.PROMPT,
+        completion: DEFAULTS.TOKENS.COMPLETION,
+        total: DEFAULTS.TOKENS.TOTAL,
+      },
       toolCalls: {
-        list: result.toolCalls ? result.toolCalls.map(this.formatToolCall.bind(this)) : [],
-        count: result.toolCalls?.length || 0,
+        list: result.toolCalls?.map(this.formatToolCall.bind(this)) || [],
+        count: result.toolCalls?.length || DEFAULTS.EXECUTION_TIME,
       },
       providerTiming: result.timing,
       cost: result.cost,
@@ -934,6 +1272,8 @@ export class AgentBlockHandler implements BlockHandler {
   }
 
   private stripCustomToolPrefix(name: string): string {
-    return name.startsWith('custom_') ? name.replace('custom_', '') : name
+    return name.startsWith(AGENT.CUSTOM_TOOL_PREFIX)
+      ? name.replace(AGENT.CUSTOM_TOOL_PREFIX, '')
+      : name
   }
 }

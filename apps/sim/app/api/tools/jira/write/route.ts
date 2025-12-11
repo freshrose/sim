@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
+import { validateAlphanumericId, validateJiraCloudId } from '@/lib/core/security/input-validation'
 import { createLogger } from '@/lib/logs/console/logger'
-import { validateAlphanumericId, validateJiraCloudId } from '@/lib/security/input-validation'
 import { getJiraCloudId } from '@/tools/jira/utils'
 
 export const dynamic = 'force-dynamic'
@@ -71,7 +71,7 @@ export async function POST(request: Request) {
       summary: summary,
     }
 
-    if (description) {
+    if (description !== undefined && description !== null && description !== '') {
       fields.description = {
         type: 'doc',
         version: 1,
@@ -89,17 +89,17 @@ export async function POST(request: Request) {
       }
     }
 
-    if (parent) {
+    if (parent !== undefined && parent !== null && parent !== '') {
       fields.parent = parent
     }
 
-    if (priority) {
+    if (priority !== undefined && priority !== null && priority !== '') {
       fields.priority = {
         name: priority,
       }
     }
 
-    if (assignee) {
+    if (assignee !== undefined && assignee !== null && assignee !== '') {
       fields.assignee = {
         id: assignee,
       }

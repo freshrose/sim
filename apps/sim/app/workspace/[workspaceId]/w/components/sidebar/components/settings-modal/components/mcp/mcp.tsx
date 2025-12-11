@@ -1,124 +1,188 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertCircle, Plus, Search, X } from 'lucide-react'
+import { useCallback, useMemo, useRef, useState } from 'react'
+import { Plus, Search } from 'lucide-react'
 import { useParams } from 'next/navigation'
 import {
-  Alert,
-  AlertDescription,
   Button,
-  Input,
-  Label,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  Skeleton,
-} from '@/components/ui'
-import { checkEnvVarTrigger, EnvVarDropdown } from '@/components/ui/env-var-dropdown'
-import { formatDisplayText } from '@/components/ui/formatted-text'
+  Input as EmcnInput,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+} from '@/components/emcn'
+import { Input } from '@/components/ui'
 import { createLogger } from '@/lib/logs/console/logger'
-import type { McpTransport } from '@/lib/mcp/types'
+import { checkEnvVarTrigger } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/env-var-dropdown'
+import {
+  useCreateMcpServer,
+  useDeleteMcpServer,
+  useMcpServers,
+  useMcpToolsQuery,
+} from '@/hooks/queries/mcp'
 import { useMcpServerTest } from '@/hooks/use-mcp-server-test'
-import { useMcpTools } from '@/hooks/use-mcp-tools'
-import { useMcpServersStore } from '@/stores/mcp-servers/store'
+import type { InputFieldType, McpServerFormData, McpServerTestResult } from './components'
+import {
+  FormattedInput,
+  FormField,
+  formatTransportLabel,
+  HeaderRow,
+  McpServerSkeleton,
+  ServerListItem,
+} from './components'
+
+interface McpTool {
+  name: string
+  description?: string
+  serverId: string
+}
+
+interface McpServer {
+  id: string
+  name?: string
+  transport?: string
+  url?: string
+}
 
 const logger = createLogger('McpSettings')
 
-interface McpServerFormData {
-  name: string
-  transport: McpTransport
-  url?: string
-  timeout?: number
-  headers?: Record<string, string>
+const DEFAULT_FORM_DATA: McpServerFormData = {
+  name: '',
+  transport: 'streamable-http',
+  url: '',
+  timeout: 30000,
+  headers: [{ key: '', value: '' }],
 }
 
+/**
+ * Determines the label for the test connection button based on current state.
+ */
+function getTestButtonLabel(
+  testResult: McpServerTestResult | null,
+  isTestingConnection: boolean
+): string {
+  if (isTestingConnection) return 'Testing...'
+  if (testResult?.success) return 'Connection success'
+  if (testResult && !testResult.success) return 'No connection: retry'
+  return 'Test Connection'
+}
+
+/**
+ * MCP Settings component for managing Model Context Protocol servers.
+ * Handles server CRUD operations, connection testing, and environment variable integration.
+ */
 export function MCP() {
   const params = useParams()
   const workspaceId = params.workspaceId as string
-  const { mcpTools, error: toolsError, refreshTools } = useMcpTools(workspaceId)
+
   const {
-    servers,
+    data: servers = [],
     isLoading: serversLoading,
     error: serversError,
-    fetchServers,
-    createServer,
-    deleteServer,
-  } = useMcpServersStore()
+  } = useMcpServers(workspaceId)
+  const {
+    data: mcpToolsData = [],
+    error: toolsError,
+    isLoading: toolsLoading,
+    isFetching: toolsFetching,
+  } = useMcpToolsQuery(workspaceId)
+  const createServerMutation = useCreateMcpServer()
+  const deleteServerMutation = useDeleteMcpServer()
+  const { testResult, isTestingConnection, testConnection, clearTestResult } = useMcpServerTest()
 
+  const urlInputRef = useRef<HTMLInputElement>(null)
+
+  // Form state
   const [showAddForm, setShowAddForm] = useState(false)
+  const [formData, setFormData] = useState<McpServerFormData>(DEFAULT_FORM_DATA)
+  const [isAddingServer, setIsAddingServer] = useState(false)
+
+  // Search and filtering state
   const [searchTerm, setSearchTerm] = useState('')
   const [deletingServers, setDeletingServers] = useState<Set<string>>(new Set())
-  const [formData, setFormData] = useState<McpServerFormData>({
-    name: '',
-    transport: 'streamable-http',
-    url: '',
-    timeout: 30000,
-    headers: {}, // Start with no headers
-  })
+
+  // Delete confirmation dialog state
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [serverToDelete, setServerToDelete] = useState<{ id: string; name: string } | null>(null)
+
+  // Server details view state
+  const [selectedServerId, setSelectedServerId] = useState<string | null>(null)
 
   // Environment variable dropdown state
   const [showEnvVars, setShowEnvVars] = useState(false)
   const [envSearchTerm, setEnvSearchTerm] = useState('')
   const [cursorPosition, setCursorPosition] = useState(0)
-  const [activeInputField, setActiveInputField] = useState<
-    'url' | 'header-key' | 'header-value' | null
-  >(null)
+  const [activeInputField, setActiveInputField] = useState<InputFieldType | null>(null)
   const [activeHeaderIndex, setActiveHeaderIndex] = useState<number | null>(null)
-  const urlInputRef = useRef<HTMLInputElement>(null)
 
-  // MCP server testing
-  const { testResult, isTestingConnection, testConnection, clearTestResult } = useMcpServerTest()
-
-  // Loading state for adding server
-  const [isAddingServer, setIsAddingServer] = useState(false)
-
-  // State for tracking input scroll position
+  // Scroll position state for formatted text overlays
   const [urlScrollLeft, setUrlScrollLeft] = useState(0)
   const [headerScrollLeft, setHeaderScrollLeft] = useState<Record<string, number>>({})
 
-  // Handle environment variable selection
+  /**
+   * Resets environment variable dropdown state.
+   */
+  const resetEnvVarState = useCallback(() => {
+    setShowEnvVars(false)
+    setActiveInputField(null)
+    setActiveHeaderIndex(null)
+  }, [])
+
+  /**
+   * Resets the form to its default state.
+   */
+  const resetForm = useCallback(() => {
+    setFormData(DEFAULT_FORM_DATA)
+    setShowAddForm(false)
+    resetEnvVarState()
+    clearTestResult()
+  }, [clearTestResult, resetEnvVarState])
+
+  /**
+   * Updates a header field at the specified index.
+   */
+  const updateHeader = useCallback((index: number, field: 'key' | 'value', value: string) => {
+    setFormData((prev) => {
+      const newHeaders = [...(prev.headers || [])]
+      if (newHeaders[index]) {
+        newHeaders[index] = { ...newHeaders[index], [field]: value }
+      }
+      return { ...prev, headers: newHeaders }
+    })
+  }, [])
+
+  /**
+   * Handles environment variable selection and updates the appropriate field.
+   */
   const handleEnvVarSelect = useCallback(
     (newValue: string) => {
       if (activeInputField === 'url') {
         setFormData((prev) => ({ ...prev, url: newValue }))
-      } else if (activeInputField === 'header-key' && activeHeaderIndex !== null) {
-        const headerEntries = Object.entries(formData.headers || {})
-        const [oldKey, value] = headerEntries[activeHeaderIndex]
-        const newHeaders = { ...formData.headers }
-        delete newHeaders[oldKey]
-        newHeaders[newValue.replace(/[{}]/g, '')] = value
-        setFormData((prev) => ({ ...prev, headers: newHeaders }))
-      } else if (activeInputField === 'header-value' && activeHeaderIndex !== null) {
-        const headerEntries = Object.entries(formData.headers || {})
-        const [key] = headerEntries[activeHeaderIndex]
-        setFormData((prev) => ({
-          ...prev,
-          headers: { ...prev.headers, [key]: newValue },
-        }))
+      } else if (activeHeaderIndex !== null) {
+        const field = activeInputField === 'header-key' ? 'key' : 'value'
+        const processedValue = field === 'key' ? newValue.replace(/[{}]/g, '') : newValue
+        updateHeader(activeHeaderIndex, field, processedValue)
       }
-      setShowEnvVars(false)
-      setActiveInputField(null)
-      setActiveHeaderIndex(null)
+      resetEnvVarState()
     },
-    [activeInputField, activeHeaderIndex, formData.headers]
+    [activeInputField, activeHeaderIndex, updateHeader, resetEnvVarState]
   )
 
-  // Handle input change with env var detection
+  /**
+   * Handles input changes and manages environment variable dropdown visibility.
+   */
   const handleInputChange = useCallback(
-    (field: 'url' | 'header-key' | 'header-value', value: string, headerIndex?: number) => {
+    (field: InputFieldType, value: string, headerIndex?: number) => {
       const input = document.activeElement as HTMLInputElement
       const pos = input?.selectionStart || 0
 
       setCursorPosition(pos)
 
-      // Clear test result when any field changes
       if (testResult) {
         clearTestResult()
       }
 
-      // Check if we should show the environment variables dropdown
       const envVarTrigger = checkEnvVarTrigger(value, pos)
       setShowEnvVars(envVarTrigger.show)
       setEnvSearchTerm(envVarTrigger.show ? envVarTrigger.searchTerm : '')
@@ -127,32 +191,39 @@ export function MCP() {
         setActiveInputField(field)
         setActiveHeaderIndex(headerIndex ?? null)
       } else {
-        setActiveInputField(null)
-        setActiveHeaderIndex(null)
+        resetEnvVarState()
       }
 
-      // Update form data
       if (field === 'url') {
         setFormData((prev) => ({ ...prev, url: value }))
-      } else if (field === 'header-key' && headerIndex !== undefined) {
-        const headerEntries = Object.entries(formData.headers || {})
-        const [oldKey, headerValue] = headerEntries[headerIndex]
-        const newHeaders = { ...formData.headers }
-        delete newHeaders[oldKey]
-        newHeaders[value] = headerValue
-        setFormData((prev) => ({ ...prev, headers: newHeaders }))
-      } else if (field === 'header-value' && headerIndex !== undefined) {
-        const headerEntries = Object.entries(formData.headers || {})
-        const [key] = headerEntries[headerIndex]
-        setFormData((prev) => ({
-          ...prev,
-          headers: { ...prev.headers, [key]: value },
-        }))
+      } else if (headerIndex !== undefined) {
+        const headerField = field === 'header-key' ? 'key' : 'value'
+        updateHeader(headerIndex, headerField, value)
       }
     },
-    [formData.headers]
+    [testResult, clearTestResult, updateHeader, resetEnvVarState]
   )
 
+  /**
+   * Converts headers array to Record format for API calls.
+   * Filters out entries with empty keys.
+   */
+  const headersToRecord = useCallback(
+    (headers: typeof formData.headers): Record<string, string> => {
+      const record: Record<string, string> = {}
+      for (const header of headers || []) {
+        if (header.key.trim()) {
+          record[header.key] = header.value
+        }
+      }
+      return record
+    },
+    []
+  )
+
+  /**
+   * Tests the connection to the MCP server with current form data.
+   */
   const handleTestConnection = useCallback(async () => {
     if (!formData.name.trim() || !formData.url?.trim()) return
 
@@ -160,66 +231,52 @@ export function MCP() {
       name: formData.name,
       transport: formData.transport,
       url: formData.url,
-      headers: formData.headers,
+      headers: headersToRecord(formData.headers),
       timeout: formData.timeout,
       workspaceId,
     })
-  }, [formData, testConnection, workspaceId])
+  }, [formData, testConnection, workspaceId, headersToRecord])
 
+  /**
+   * Adds a new MCP server after validating and testing the connection.
+   */
   const handleAddServer = useCallback(async () => {
     if (!formData.name.trim()) return
 
     setIsAddingServer(true)
     try {
-      // If no test has been done, test first
-      if (!testResult) {
-        const result = await testConnection({
-          name: formData.name,
-          transport: formData.transport,
-          url: formData.url,
-          headers: formData.headers,
-          timeout: formData.timeout,
-          workspaceId,
-        })
-
-        // If test fails, don't proceed
-        if (!result.success) {
-          return
-        }
-      }
-
-      // If we have a failed test result, don't proceed
-      if (testResult && !testResult.success) {
-        return
-      }
-
-      await createServer(workspaceId, {
-        name: formData.name.trim(),
+      const headersRecord = headersToRecord(formData.headers)
+      const serverConfig = {
+        name: formData.name,
         transport: formData.transport,
         url: formData.url,
-        timeout: formData.timeout || 30000,
-        headers: formData.headers,
-        enabled: true,
+        headers: headersRecord,
+        timeout: formData.timeout,
+        workspaceId,
+      }
+
+      // Test connection if not already tested
+      if (!testResult) {
+        const result = await testConnection(serverConfig)
+        if (!result.success) return
+      }
+
+      if (testResult && !testResult.success) return
+
+      await createServerMutation.mutateAsync({
+        workspaceId,
+        config: {
+          name: formData.name.trim(),
+          transport: formData.transport,
+          url: formData.url,
+          timeout: formData.timeout || 30000,
+          headers: headersRecord,
+          enabled: true,
+        },
       })
 
       logger.info(`Added MCP server: ${formData.name}`)
-
-      // Reset form and hide form immediately after server creation
-      setFormData({
-        name: '',
-        transport: 'streamable-http',
-        url: '',
-        timeout: 30000,
-        headers: {}, // Reset with no headers
-      })
-      setShowAddForm(false)
-      setShowEnvVars(false)
-      setActiveInputField(null)
-      setActiveHeaderIndex(null)
-      clearTestResult()
-
-      // Refresh tools in the background without waiting
-      refreshTools(true) // Force refresh after adding server
+      resetForm()
     } catch (error) {
       logger.error('Failed to add MCP server:', error)
     } finally {
@@ -229,852 +286,406 @@ export function MCP() {
     formData,
     testResult,
     testConnection,
-    createServer,
-    refreshTools,
-    clearTestResult,
+    createServerMutation,
     workspaceId,
+    headersToRecord,
+    resetForm,
   ])
 
-  const handleRemoveServer = useCallback(
-    async (serverId: string) => {
-      // Add server to deleting set
-      setDeletingServers((prev) => new Set(prev).add(serverId))
+  /**
+   * Opens the delete confirmation dialog for an MCP server.
+   */
+  const handleRemoveServer = useCallback((serverId: string, serverName: string) => {
+    setServerToDelete({ id: serverId, name: serverName })
+    setShowDeleteDialog(true)
+  }, [])
 
-      try {
-        await deleteServer(workspaceId, serverId)
-        await refreshTools(true) // Force refresh after removing server
+  /**
+   * Confirms and executes the server deletion.
+   */
+  const confirmDeleteServer = useCallback(async () => {
+    if (!serverToDelete) return
 
-        logger.info(`Removed MCP server: ${serverId}`)
-      } catch (error) {
-        logger.error('Failed to remove MCP server:', error)
-        // Remove from deleting set on error so user can try again
-        setDeletingServers((prev) => {
-          const newSet = new Set(prev)
-          newSet.delete(serverId)
-          return newSet
-        })
-      } finally {
-        // Remove from deleting set after successful deletion
-        setDeletingServers((prev) => {
-          const newSet = new Set(prev)
-          newSet.delete(serverId)
-          return newSet
-        })
-      }
-    },
-    [deleteServer, refreshTools, workspaceId]
-  )
+    setShowDeleteDialog(false)
+    const { id: serverId, name: serverName } = serverToDelete
+    setServerToDelete(null)
 
-  // Load data on mount only
-  useEffect(() => {
-    fetchServers(workspaceId)
-    refreshTools() // Don't force refresh on mount
-  }, [fetchServers, refreshTools, workspaceId])
+    setDeletingServers((prev) => new Set(prev).add(serverId))
 
-  const toolsByServer = (mcpTools || []).reduce(
-    (acc, tool) => {
-      if (!tool || !tool.serverId) {
-        return acc // Skip invalid tools
-      }
-      if (!acc[tool.serverId]) {
-        acc[tool.serverId] = []
-      }
-      acc[tool.serverId].push(tool)
-      return acc
-    },
-    {} as Record<string, typeof mcpTools>
-  )
+    try {
+      await deleteServerMutation.mutateAsync({ workspaceId, serverId })
+      logger.info(`Removed MCP server: ${serverName}`)
+    } catch (error) {
+      logger.error('Failed to remove MCP server:', error)
+    } finally {
+      setDeletingServers((prev) => {
+        const newSet = new Set(prev)
+        newSet.delete(serverId)
+        return newSet
+      })
+    }
+  }, [serverToDelete, deleteServerMutation, workspaceId])
 
-  // Filter servers based on search term
-  const filteredServers = (servers || []).filter((server) =>
-    server.name?.toLowerCase().includes(searchTerm.toLowerCase())
-  )
+  /**
+   * Groups tools by their server ID for display.
+   */
+  const toolsByServer = useMemo(() => {
+    return (mcpToolsData || []).reduce(
+      (acc, tool) => {
+        if (!tool?.serverId) return acc
+        if (!acc[tool.serverId]) {
+          acc[tool.serverId] = []
+        }
+        acc[tool.serverId].push(tool)
+        return acc
+      },
+      {} as Record<string, typeof mcpToolsData>
+    )
+  }, [mcpToolsData])
+
+  /**
+   * Filters servers based on search term.
+   */
+  const filteredServers = useMemo(() => {
+    return (servers || []).filter((server) =>
+      server.name?.toLowerCase().includes(searchTerm.toLowerCase())
+    )
+  }, [servers, searchTerm])
+
+  const handleNameChange = useCallback((value: string) => {
+    setFormData((prev) => ({ ...prev, name: value }))
+  }, [])
+
+  const handleUrlScroll = useCallback((scrollLeft: number) => {
+    setUrlScrollLeft(scrollLeft)
+  }, [])
+
+  const handleHeaderScroll = useCallback((key: string, scrollLeft: number) => {
+    setHeaderScrollLeft((prev) => ({ ...prev, [key]: scrollLeft }))
+  }, [])
+
+  const handleAddHeader = useCallback(() => {
+    setFormData((prev) => ({
+      ...prev,
+      headers: [...(prev.headers || []), { key: '', value: '' }],
+    }))
+  }, [])
+
+  const handleRemoveHeader = useCallback((index: number) => {
+    setFormData((prev) => ({
+      ...prev,
+      headers: (prev.headers || []).filter((_, i) => i !== index),
+    }))
+  }, [])
+
+  const handleCancelForm = useCallback(() => {
+    setShowAddForm(false)
+  }, [])
+
+  /**
+   * Opens the detail view for a specific server.
+   */
+  const handleViewDetails = useCallback((serverId: string) => {
+    setSelectedServerId(serverId)
+  }, [])
+
+  /**
+   * Closes the detail view and returns to the server list.
+   */
+  const handleBackToList = useCallback(() => {
+    setSelectedServerId(null)
+  }, [])
+
+  /**
+   * Gets the selected server and its tools for the detail view.
+   */
+  const selectedServer = useMemo(() => {
+    if (!selectedServerId) return null
+    const server = servers.find((s) => s.id === selectedServerId) as McpServer | undefined
+    if (!server) return null
+    const serverTools = (toolsByServer[selectedServerId] || []) as McpTool[]
+    return { server, tools: serverTools }
+  }, [selectedServerId, servers, toolsByServer])
+
+  const error = toolsError || serversError
+  const hasServers = servers && servers.length > 0
+  const showEmptyState = !hasServers && !showAddForm
+  const showNoResults = searchTerm.trim() && filteredServers.length === 0 && servers.length > 0
+
+  // Form validation state
+  const isFormValid = formData.name.trim() && formData.url?.trim()
+  const isSubmitDisabled = serversLoading || isAddingServer || !isFormValid
+  const testButtonLabel = getTestButtonLabel(testResult, isTestingConnection)
+
+  // Show detail view if a server is selected
+  if (selectedServer) {
+    const { server, tools } = selectedServer
+    const transportLabel = formatTransportLabel(server.transport || 'http')
+
+    return (
+      <div className='flex h-full flex-col gap-[16px]'>
+        <div className='min-h-0 flex-1 overflow-y-auto'>
+          <div className='flex flex-col gap-[16px]'>
+            <div className='flex flex-col gap-[8px]'>
+              <span className='font-medium text-[13px] text-[var(--text-primary)]'>
+                Server Name
+              </span>
+              <p className='text-[14px] text-[var(--text-secondary)]'>
+                {server.name || 'Unnamed Server'}
+              </p>
+            </div>
+
+            <div className='flex flex-col gap-[8px]'>
+              <span className='font-medium text-[13px] text-[var(--text-primary)]'>Transport</span>
+              <p className='text-[14px] text-[var(--text-secondary)]'>{transportLabel}</p>
+            </div>
+
+            {server.url && (
+              <div className='flex flex-col gap-[8px]'>
+                <span className='font-medium text-[13px] text-[var(--text-primary)]'>URL</span>
+                <p className='break-all font-mono text-[13px] text-[var(--text-secondary)]'>
+                  {server.url}
+                </p>
+              </div>
+            )}
+
+            <div className='flex flex-col gap-[8px]'>
+              <span className='font-medium text-[13px] text-[var(--text-primary)]'>
+                Tools ({tools.length})
+              </span>
+              {tools.length === 0 ? (
+                <p className='text-[13px] text-[var(--text-muted)]'>No tools available</p>
+              ) : (
+                <div className='flex flex-col gap-[8px]'>
+                  {tools.map((tool) => (
+                    <div
+                      key={tool.name}
+                      className='rounded-[6px] border bg-[var(--surface-3)] px-[10px] py-[8px]'
+                    >
+                      <p className='font-medium text-[13px] text-[var(--text-primary)]'>
+                        {tool.name}
+                      </p>
+                      {tool.description && (
+                        <p className='mt-[4px] text-[13px] text-[var(--text-tertiary)]'>
+                          {tool.description}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className='mt-auto flex items-center justify-end'>
+          <Button
+            onClick={handleBackToList}
+            variant='primary'
+            className='!bg-[var(--brand-tertiary-2)] !text-[var(--text-inverse)] hover:!bg-[var(--brand-tertiary-2)]/90'
+          >
+            Back
+          </Button>
+        </div>
+      </div>
+    )
+  }
 
   return (
-    <div className='relative flex h-full flex-col'>
-      {/* Fixed Header with Search */}
-      <div className='px-6 pt-4 pb-2'>
-        {/* Search Input */}
-        {serversLoading ? (
-          <Skeleton className='h-9 w-56 rounded-lg' />
-        ) : (
-          <div className='flex h-9 w-56 items-center gap-2 rounded-lg border bg-transparent pr-2 pl-3'>
-            <Search className='h-4 w-4 flex-shrink-0 text-muted-foreground' strokeWidth={2} />
+    <>
+      <div className='flex h-full flex-col gap-[16px]'>
+        <div className='flex items-center gap-[8px]'>
+          <div className='flex flex-1 items-center gap-[8px] rounded-[8px] border bg-[var(--surface-6)] px-[8px] py-[5px]'>
+            <Search
+              className='h-[14px] w-[14px] flex-shrink-0 text-[var(--text-tertiary)]'
+              strokeWidth={2}
+            />
             <Input
-              placeholder='Search servers...'
+              placeholder='Search MCPs...'
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className='flex-1 border-0 bg-transparent px-0 font-[380] font-sans text-base text-foreground leading-none placeholder:text-muted-foreground focus-visible:ring-0 focus-visible:ring-offset-0'
+              className='h-auto flex-1 border-0 bg-transparent p-0 font-base leading-none placeholder:text-[var(--text-tertiary)] focus-visible:ring-0 focus-visible:ring-offset-0'
             />
+          </div>
+          <Button
+            onClick={() => setShowAddForm(!showAddForm)}
+            variant='primary'
+            disabled={serversLoading}
+            className='!bg-[var(--brand-tertiary-2)] !text-[var(--text-inverse)] hover:!bg-[var(--brand-tertiary-2)]/90'
+          >
+            <Plus className='mr-[6px] h-[13px] w-[13px]' />
+            Add
+          </Button>
+        </div>
+
+        {showAddForm && !serversLoading && (
+          <div className='rounded-[8px] border bg-[var(--surface-3)] p-[10px]'>
+            <div className='flex flex-col gap-[8px]'>
+              <FormField label='Server Name'>
+                <EmcnInput
+                  placeholder='e.g., My MCP Server'
+                  value={formData.name}
+                  onChange={(e) => {
+                    if (testResult) clearTestResult()
+                    handleNameChange(e.target.value)
+                  }}
+                  className='h-9'
+                />
+              </FormField>
+
+              <FormField label='Server URL'>
+                <FormattedInput
+                  ref={urlInputRef}
+                  placeholder='https://mcp.server.dev/{{YOUR_API_KEY}}/sse'
+                  value={formData.url || ''}
+                  scrollLeft={urlScrollLeft}
+                  showEnvVars={showEnvVars && activeInputField === 'url'}
+                  envVarProps={{
+                    searchTerm: envSearchTerm,
+                    cursorPosition,
+                    workspaceId,
+                    onSelect: handleEnvVarSelect,
+                    onClose: resetEnvVarState,
+                  }}
+                  onChange={(e) => handleInputChange('url', e.target.value)}
+                  onScroll={(scrollLeft) => handleUrlScroll(scrollLeft)}
+                />
+              </FormField>
+
+              <div className='flex flex-col gap-[8px]'>
+                <div className='flex items-center justify-between'>
+                  <span className='font-medium text-[13px] text-[var(--text-secondary)]'>
+                    Headers
+                  </span>
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    onClick={handleAddHeader}
+                    className='h-6 w-6 p-0'
+                  >
+                    <Plus className='h-3 w-3' />
+                  </Button>
+                </div>
+
+                <div className='flex max-h-[140px] flex-col gap-[8px] overflow-y-auto'>
+                  {(formData.headers || []).map((header, index) => (
+                    <HeaderRow
+                      key={index}
+                      header={header}
+                      index={index}
+                      headerScrollLeft={headerScrollLeft}
+                      showEnvVars={showEnvVars}
+                      activeInputField={activeInputField}
+                      activeHeaderIndex={activeHeaderIndex}
+                      envSearchTerm={envSearchTerm}
+                      cursorPosition={cursorPosition}
+                      workspaceId={workspaceId}
+                      onInputChange={handleInputChange}
+                      onHeaderScroll={handleHeaderScroll}
+                      onEnvVarSelect={handleEnvVarSelect}
+                      onEnvVarClose={resetEnvVarState}
+                      onRemove={() => handleRemoveHeader(index)}
+                    />
+                  ))}
+                </div>
+              </div>
+
+              <div className='flex items-center justify-between pt-[12px]'>
+                <Button
+                  variant='default'
+                  onClick={handleTestConnection}
+                  disabled={isTestingConnection || !isFormValid}
+                >
+                  {testButtonLabel}
+                </Button>
+
+                <div className='flex items-center gap-[8px]'>
+                  <Button variant='ghost' onClick={handleCancelForm}>
+                    Cancel
+                  </Button>
+                  <Button
+                    onClick={handleAddServer}
+                    disabled={isSubmitDisabled}
+                    className='!bg-[var(--brand-tertiary-2)] !text-[var(--text-inverse)] hover:!bg-[var(--brand-tertiary-2)]/90'
+                  >
+                    {isSubmitDisabled && isFormValid ? 'Adding...' : 'Add Server'}
+                  </Button>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
-        {/* Error Alert */}
-        {(toolsError || serversError) && (
-          <Alert variant='destructive' className='mt-4'>
-            <AlertCircle className='h-4 w-4' />
-            <AlertDescription>{toolsError || serversError}</AlertDescription>
-          </Alert>
-        )}
-      </div>
-
-      {/* Scrollable Content */}
-      <div className='scrollbar-thin scrollbar-thumb-muted scrollbar-track-transparent min-h-0 flex-1 overflow-y-auto px-6'>
-        <div className='h-full space-y-4 py-2'>
-          {/* Server List */}
-          {serversLoading ? (
-            <div className='space-y-4'>
+        <div className='min-h-0 flex-1 overflow-y-auto'>
+          {error ? (
+            <div className='flex h-full flex-col items-center justify-center gap-[8px]'>
+              <p className='text-[#DC2626] text-[11px] leading-tight dark:text-[#F87171]'>
+                {error instanceof Error ? error.message : 'Failed to load MCP servers'}
+              </p>
+            </div>
+          ) : serversLoading ? (
+            <div className='flex flex-col gap-[8px]'>
               <McpServerSkeleton />
               <McpServerSkeleton />
               <McpServerSkeleton />
             </div>
-          ) : !servers || servers.length === 0 ? (
-            showAddForm ? (
-              <div className='rounded-[8px] border bg-background p-4 shadow-xs'>
-                <div className='space-y-3'>
-                  <div className='flex items-center justify-between'>
-                    <div className='flex items-center gap-2'>
-                      <Label className='font-normal'>Server Name</Label>
-                    </div>
-                    <div className='w-[380px]'>
-                      <Input
-                        placeholder='e.g., My MCP Server'
-                        value={formData.name}
-                        onChange={(e) => {
-                          if (testResult) clearTestResult()
-                          setFormData((prev) => ({ ...prev, name: e.target.value }))
-                        }}
-                        className='h-9'
-                      />
-                    </div>
-                  </div>
-
-                  <div className='flex items-center justify-between'>
-                    <div className='flex items-center gap-2'>
-                      <Label className='font-normal'>Transport</Label>
-                    </div>
-                    <div className='w-[380px]'>
-                      <Select
-                        value={formData.transport}
-                        onValueChange={(value: 'http' | 'sse' | 'streamable-http') => {
-                          if (testResult) clearTestResult()
-                          setFormData((prev) => ({ ...prev, transport: value }))
-                        }}
-                      >
-                        <SelectTrigger className='h-9'>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value='streamable-http'>Streamable HTTP</SelectItem>
-                          <SelectItem value='http'>HTTP</SelectItem>
-                          <SelectItem value='sse'>Server-Sent Events</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-
-                  <div className='flex items-center justify-between'>
-                    <div className='flex items-center gap-2'>
-                      <Label className='font-normal'>Server URL</Label>
-                    </div>
-                    <div className='relative w-[380px]'>
-                      <Input
-                        ref={urlInputRef}
-                        placeholder='https://mcp.server.dev/{{YOUR_API_KEY}}/sse'
-                        value={formData.url}
-                        onChange={(e) => handleInputChange('url', e.target.value)}
-                        onScroll={(e) => {
-                          const scrollLeft = e.currentTarget.scrollLeft
-                          setUrlScrollLeft(scrollLeft)
-                        }}
-                        onInput={(e) => {
-                          const scrollLeft = e.currentTarget.scrollLeft
-                          setUrlScrollLeft(scrollLeft)
-                        }}
-                        className='h-9 text-transparent caret-foreground placeholder:text-muted-foreground/50'
-                      />
-                      {/* Overlay for styled text display */}
-                      <div className='pointer-events-none absolute inset-0 flex items-center overflow-hidden px-3 text-sm'>
-                        <div
-                          className='whitespace-nowrap'
-                          style={{ transform: `translateX(-${urlScrollLeft}px)` }}
-                        >
-                          {formatDisplayText(formData.url || '')}
-                        </div>
-                      </div>
-
-                      {/* Environment Variables Dropdown */}
-                      {showEnvVars && activeInputField === 'url' && (
-                        <EnvVarDropdown
-                          visible={showEnvVars}
-                          onSelect={handleEnvVarSelect}
-                          searchTerm={envSearchTerm}
-                          inputValue={formData.url || ''}
-                          cursorPosition={cursorPosition}
-                          workspaceId={workspaceId}
-                          onClose={() => {
-                            setShowEnvVars(false)
-                            setActiveInputField(null)
-                          }}
-                          className='w-[380px]'
-                          maxHeight='200px'
-                          style={{
-                            position: 'absolute',
-                            top: '100%',
-                            left: 0,
-                            zIndex: 99999,
-                          }}
-                        />
-                      )}
-                    </div>
-                  </div>
-
-                  {Object.entries(formData.headers || {}).map(([key, value], index) => (
-                    <div key={index} className='relative flex items-center justify-between'>
-                      <div className='flex items-center gap-2'>
-                        <Label className='font-normal'>Header</Label>
-                      </div>
-                      <div className='relative flex w-[380px] gap-2'>
-                        {/* Header Key Input */}
-                        <div className='relative flex-1'>
-                          <Input
-                            placeholder='Name'
-                            value={key}
-                            onChange={(e) => handleInputChange('header-key', e.target.value, index)}
-                            onScroll={(e) => {
-                              const scrollLeft = e.currentTarget.scrollLeft
-                              setHeaderScrollLeft((prev) => ({
-                                ...prev,
-                                [`key-${index}`]: scrollLeft,
-                              }))
-                            }}
-                            onInput={(e) => {
-                              const scrollLeft = e.currentTarget.scrollLeft
-                              setHeaderScrollLeft((prev) => ({
-                                ...prev,
-                                [`key-${index}`]: scrollLeft,
-                              }))
-                            }}
-                            className='h-9 text-transparent caret-foreground placeholder:text-muted-foreground/50'
-                          />
-                          <div className='pointer-events-none absolute inset-0 flex items-center overflow-hidden px-3 text-sm'>
-                            <div
-                              className='whitespace-nowrap'
-                              style={{
-                                transform: `translateX(-${headerScrollLeft[`key-${index}`] || 0}px)`,
-                              }}
-                            >
-                              {formatDisplayText(key || '')}
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Header Value Input */}
-                        <div className='relative flex-1'>
-                          <Input
-                            placeholder='Value'
-                            value={value}
-                            onChange={(e) =>
-                              handleInputChange('header-value', e.target.value, index)
-                            }
-                            onScroll={(e) => {
-                              const scrollLeft = e.currentTarget.scrollLeft
-                              setHeaderScrollLeft((prev) => ({
-                                ...prev,
-                                [`value-${index}`]: scrollLeft,
-                              }))
-                            }}
-                            onInput={(e) => {
-                              const scrollLeft = e.currentTarget.scrollLeft
-                              setHeaderScrollLeft((prev) => ({
-                                ...prev,
-                                [`value-${index}`]: scrollLeft,
-                              }))
-                            }}
-                            className='h-9 text-transparent caret-foreground placeholder:text-muted-foreground/50'
-                          />
-                          <div className='pointer-events-none absolute inset-0 flex items-center overflow-hidden px-3 text-sm'>
-                            <div
-                              className='whitespace-nowrap'
-                              style={{
-                                transform: `translateX(-${headerScrollLeft[`value-${index}`] || 0}px)`,
-                              }}
-                            >
-                              {formatDisplayText(value || '')}
-                            </div>
-                          </div>
-                        </div>
-
-                        <Button
-                          type='button'
-                          variant='ghost'
-                          size='sm'
-                          onClick={() => {
-                            const newHeaders = { ...formData.headers }
-                            delete newHeaders[key]
-                            setFormData((prev) => ({ ...prev, headers: newHeaders }))
-                          }}
-                          className='h-9 w-9 p-0 text-muted-foreground hover:text-foreground'
-                        >
-                          <X className='h-3 w-3' />
-                        </Button>
-
-                        {/* Environment Variables Dropdown for Header Key */}
-                        {showEnvVars &&
-                          activeInputField === 'header-key' &&
-                          activeHeaderIndex === index && (
-                            <EnvVarDropdown
-                              visible={showEnvVars}
-                              onSelect={handleEnvVarSelect}
-                              searchTerm={envSearchTerm}
-                              inputValue={key}
-                              cursorPosition={cursorPosition}
-                              workspaceId={workspaceId}
-                              onClose={() => {
-                                setShowEnvVars(false)
-                                setActiveInputField(null)
-                                setActiveHeaderIndex(null)
-                              }}
-                              className='w-[380px]'
-                              maxHeight='200px'
-                              style={{
-                                position: 'absolute',
-                                top: '100%',
-                                left: 0,
-                                zIndex: 99999,
-                              }}
-                            />
-                          )}
-
-                        {/* Environment Variables Dropdown for Header Value */}
-                        {showEnvVars &&
-                          activeInputField === 'header-value' &&
-                          activeHeaderIndex === index && (
-                            <EnvVarDropdown
-                              visible={showEnvVars}
-                              onSelect={handleEnvVarSelect}
-                              searchTerm={envSearchTerm}
-                              inputValue={value}
-                              cursorPosition={cursorPosition}
-                              workspaceId={workspaceId}
-                              onClose={() => {
-                                setShowEnvVars(false)
-                                setActiveInputField(null)
-                                setActiveHeaderIndex(null)
-                              }}
-                              className='w-[380px]'
-                              maxHeight='200px'
-                              style={{
-                                position: 'absolute',
-                                top: '100%',
-                                left: 0,
-                                zIndex: 99999,
-                              }}
-                            />
-                          )}
-                      </div>
-                    </div>
-                  ))}
-
-                  <div className='flex items-center justify-between'>
-                    <div />
-                    <div className='w-[380px]'>
-                      <Button
-                        type='button'
-                        variant='outline'
-                        size='sm'
-                        onClick={() => {
-                          setFormData((prev) => ({
-                            ...prev,
-                            headers: { ...prev.headers, '': '' },
-                          }))
-                        }}
-                        className='h-9 text-muted-foreground hover:text-foreground'
-                      >
-                        <Plus className='mr-2 h-3 w-3' />
-                        Add Header
-                      </Button>
-                    </div>
-                  </div>
-
-                  <div className='border-t pt-4'>
-                    <div className='flex items-center justify-between'>
-                      <div className='flex items-center gap-2'>
-                        <Button
-                          variant='ghost'
-                          size='sm'
-                          onClick={handleTestConnection}
-                          disabled={
-                            isTestingConnection || !formData.name.trim() || !formData.url?.trim()
-                          }
-                          className='text-muted-foreground hover:text-foreground'
-                        >
-                          {isTestingConnection ? 'Testing...' : 'Test Connection'}
-                        </Button>
-                        {testResult?.success && (
-                          <span className='text-green-600 text-xs'>✓ Connected</span>
-                        )}
-                      </div>
-                      <div className='flex items-center gap-2'>
-                        {testResult && !testResult.success && (
-                          <span className='ml-4 text-red-600 text-xs'>
-                            {testResult.error || testResult.message}
-                          </span>
-                        )}
-                        <Button variant='ghost' size='sm' onClick={() => setShowAddForm(false)}>
-                          Cancel
-                        </Button>
-                        <Button
-                          size='sm'
-                          onClick={handleAddServer}
-                          disabled={
-                            serversLoading ||
-                            isAddingServer ||
-                            !formData.name.trim() ||
-                            !formData.url?.trim()
-                          }
-                        >
-                          {serversLoading || isAddingServer ? 'Adding...' : 'Add Server'}
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              !showAddForm && (
-                <div className='flex h-full items-center justify-center text-muted-foreground text-sm'>
-                  Click "Add Server" below to get started
-                </div>
-              )
-            )
+          ) : showEmptyState ? (
+            <div className='flex h-full items-center justify-center text-[13px] text-[var(--text-muted)]'>
+              Click "Add" above to get started
+            </div>
           ) : (
-            <div className='space-y-4'>
-              {filteredServers.map((server: any) => {
-                // Add defensive checks for server properties
-                if (!server || !server.id) {
-                  return null
-                }
-
+            <div className='flex flex-col gap-[8px]'>
+              {filteredServers.map((server) => {
+                if (!server?.id) return null
                 const tools = toolsByServer[server.id] || []
+                const isLoadingTools = toolsLoading || toolsFetching
 
                 return (
-                  <div key={server.id} className='flex flex-col gap-2'>
-                    <div className='flex items-center justify-between gap-4'>
-                      <div className='flex items-center gap-3'>
-                        <div className='flex h-8 items-center rounded-[8px] bg-muted px-3'>
-                          <code className='font-mono text-foreground text-xs'>
-                            {server.name || 'Unnamed Server'}
-                          </code>
-                        </div>
-                        <span className='text-muted-foreground text-xs'>
-                          {server.transport?.toUpperCase() || 'HTTP'}
-                        </span>
-                        <span className='text-muted-foreground text-xs'>•</span>
-                        <span className='text-muted-foreground text-xs'>
-                          {tools.length} tool{tools.length !== 1 ? 's' : ''}
-                        </span>
-                      </div>
-                      <Button
-                        variant='ghost'
-                        size='sm'
-                        onClick={() => handleRemoveServer(server.id)}
-                        disabled={deletingServers.has(server.id)}
-                        className='h-8 text-muted-foreground hover:text-foreground'
-                      >
-                        {deletingServers.has(server.id) ? 'Deleting...' : 'Delete'}
-                      </Button>
-                    </div>
-                    {tools.length > 0 && (
-                      <div className='mt-1 ml-2 flex flex-wrap gap-1'>
-                        {tools.map((tool) => (
-                          <span
-                            key={tool.id}
-                            className='inline-flex h-5 items-center rounded bg-muted/50 px-2 text-muted-foreground text-xs'
-                          >
-                            {tool.name}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+                  <ServerListItem
+                    key={server.id}
+                    server={server}
+                    tools={tools}
+                    isDeleting={deletingServers.has(server.id)}
+                    isLoadingTools={isLoadingTools}
+                    onRemove={() => handleRemoveServer(server.id, server.name || 'this server')}
+                    onViewDetails={() => handleViewDetails(server.id)}
+                  />
                 )
               })}
-              {/* Show message when search has no results but there are servers */}
-              {searchTerm.trim() && filteredServers.length === 0 && servers.length > 0 && (
-                <div className='py-8 text-center text-muted-foreground text-sm'>
+              {showNoResults && (
+                <div className='py-[16px] text-center text-[13px] text-[var(--text-muted)]'>
                   No servers found matching "{searchTerm}"
                 </div>
               )}
-
-              {/* Add Server Form for when servers exist */}
-              {showAddForm && (
-                <div className='mt-4 rounded-[8px] border bg-background p-4 shadow-xs'>
-                  <div className='space-y-3'>
-                    <div className='flex items-center justify-between'>
-                      <div className='flex items-center gap-2'>
-                        <Label className='font-normal'>Server Name</Label>
-                      </div>
-                      <div className='w-[380px]'>
-                        <Input
-                          placeholder='e.g., My MCP Server'
-                          value={formData.name}
-                          onChange={(e) => {
-                            if (testResult) clearTestResult()
-                            setFormData((prev) => ({ ...prev, name: e.target.value }))
-                          }}
-                          className='h-9'
-                        />
-                      </div>
-                    </div>
-
-                    <div className='flex items-center justify-between'>
-                      <div className='flex items-center gap-2'>
-                        <Label className='font-normal'>Transport</Label>
-                      </div>
-                      <div className='w-[380px]'>
-                        <Select
-                          value={formData.transport}
-                          onValueChange={(value: 'http' | 'sse' | 'streamable-http') => {
-                            if (testResult) clearTestResult()
-                            setFormData((prev) => ({ ...prev, transport: value }))
-                          }}
-                        >
-                          <SelectTrigger className='h-9'>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value='streamable-http'>Streamable HTTP</SelectItem>
-                            <SelectItem value='http'>HTTP</SelectItem>
-                            <SelectItem value='sse'>Server-Sent Events</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                    </div>
-
-                    <div className='flex items-center justify-between'>
-                      <div className='flex items-center gap-2'>
-                        <Label className='font-normal'>Server URL</Label>
-                      </div>
-                      <div className='relative w-[380px]'>
-                        <Input
-                          ref={urlInputRef}
-                          placeholder='https://mcp.server.dev/{{YOUR_API_KEY}}/sse'
-                          value={formData.url}
-                          onChange={(e) => handleInputChange('url', e.target.value)}
-                          onScroll={(e) => {
-                            const scrollLeft = e.currentTarget.scrollLeft
-                            setUrlScrollLeft(scrollLeft)
-                          }}
-                          onInput={(e) => {
-                            const scrollLeft = e.currentTarget.scrollLeft
-                            setUrlScrollLeft(scrollLeft)
-                          }}
-                          className='h-9 text-transparent caret-foreground placeholder:text-muted-foreground/50'
-                        />
-                        {/* Overlay for styled text display */}
-                        <div className='pointer-events-none absolute inset-0 flex items-center overflow-hidden px-3 text-sm'>
-                          <div
-                            className='whitespace-nowrap'
-                            style={{ transform: `translateX(-${urlScrollLeft}px)` }}
-                          >
-                            {formatDisplayText(formData.url || '')}
-                          </div>
-                        </div>
-
-                        {/* Environment Variables Dropdown */}
-                        {showEnvVars && activeInputField === 'url' && (
-                          <EnvVarDropdown
-                            visible={showEnvVars}
-                            onSelect={handleEnvVarSelect}
-                            searchTerm={envSearchTerm}
-                            inputValue={formData.url || ''}
-                            cursorPosition={cursorPosition}
-                            workspaceId={workspaceId}
-                            onClose={() => {
-                              setShowEnvVars(false)
-                              setActiveInputField(null)
-                            }}
-                            className='w-[380px]'
-                            maxHeight='180px'
-                            style={{
-                              position: 'absolute',
-                              top: '100%',
-                              left: 0,
-                              zIndex: 99999,
-                            }}
-                          />
-                        )}
-                      </div>
-                    </div>
-
-                    {Object.entries(formData.headers || {}).map(([key, value], index) => (
-                      <div key={index} className='relative flex items-center justify-between'>
-                        <div className='flex items-center gap-2'>
-                          <Label className='font-normal'>Header</Label>
-                        </div>
-                        <div className='relative flex w-[380px] gap-2'>
-                          {/* Header Key Input */}
-                          <div className='relative flex-1'>
-                            <Input
-                              placeholder='Name'
-                              value={key}
-                              onChange={(e) =>
-                                handleInputChange('header-key', e.target.value, index)
-                              }
-                              onScroll={(e) => {
-                                const scrollLeft = e.currentTarget.scrollLeft
-                                setHeaderScrollLeft((prev) => ({
-                                  ...prev,
-                                  [`key-${index}`]: scrollLeft,
-                                }))
-                              }}
-                              onInput={(e) => {
-                                const scrollLeft = e.currentTarget.scrollLeft
-                                setHeaderScrollLeft((prev) => ({
-                                  ...prev,
-                                  [`key-${index}`]: scrollLeft,
-                                }))
-                              }}
-                              className='h-9 text-transparent caret-foreground placeholder:text-muted-foreground/50'
-                            />
-                            <div className='pointer-events-none absolute inset-0 flex items-center overflow-hidden px-3 text-sm'>
-                              <div
-                                className='whitespace-nowrap'
-                                style={{
-                                  transform: `translateX(-${headerScrollLeft[`key-${index}`] || 0}px)`,
-                                }}
-                              >
-                                {formatDisplayText(key || '')}
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Header Value Input */}
-                          <div className='relative flex-1'>
-                            <Input
-                              placeholder='Value'
-                              value={value}
-                              onChange={(e) =>
-                                handleInputChange('header-value', e.target.value, index)
-                              }
-                              onScroll={(e) => {
-                                const scrollLeft = e.currentTarget.scrollLeft
-                                setHeaderScrollLeft((prev) => ({
-                                  ...prev,
-                                  [`value-${index}`]: scrollLeft,
-                                }))
-                              }}
-                              onInput={(e) => {
-                                const scrollLeft = e.currentTarget.scrollLeft
-                                setHeaderScrollLeft((prev) => ({
-                                  ...prev,
-                                  [`value-${index}`]: scrollLeft,
-                                }))
-                              }}
-                              className='h-9 text-transparent caret-foreground placeholder:text-muted-foreground/50'
-                            />
-                            <div className='pointer-events-none absolute inset-0 flex items-center overflow-hidden px-3 text-sm'>
-                              <div
-                                className='whitespace-nowrap'
-                                style={{
-                                  transform: `translateX(-${headerScrollLeft[`value-${index}`] || 0}px)`,
-                                }}
-                              >
-                                {formatDisplayText(value || '')}
-                              </div>
-                            </div>
-                          </div>
-
-                          <Button
-                            type='button'
-                            variant='ghost'
-                            size='sm'
-                            onClick={() => {
-                              const newHeaders = { ...formData.headers }
-                              delete newHeaders[key]
-                              setFormData((prev) => ({ ...prev, headers: newHeaders }))
-                            }}
-                            className='h-9 w-9 p-0 text-muted-foreground hover:text-foreground'
-                          >
-                            <X className='h-3 w-3' />
-                          </Button>
-
-                          {/* Environment Variables Dropdown for Header Key */}
-                          {showEnvVars &&
-                            activeInputField === 'header-key' &&
-                            activeHeaderIndex === index && (
-                              <EnvVarDropdown
-                                visible={showEnvVars}
-                                onSelect={handleEnvVarSelect}
-                                searchTerm={envSearchTerm}
-                                inputValue={key}
-                                cursorPosition={cursorPosition}
-                                workspaceId={workspaceId}
-                                onClose={() => {
-                                  setShowEnvVars(false)
-                                  setActiveInputField(null)
-                                  setActiveHeaderIndex(null)
-                                }}
-                                className='w-[380px]'
-                                maxHeight='200px'
-                                style={{
-                                  position: 'absolute',
-                                  top: '100%',
-                                  left: 0,
-                                  zIndex: 99999,
-                                }}
-                              />
-                            )}
-
-                          {/* Environment Variables Dropdown for Header Value */}
-                          {showEnvVars &&
-                            activeInputField === 'header-value' &&
-                            activeHeaderIndex === index && (
-                              <EnvVarDropdown
-                                visible={showEnvVars}
-                                onSelect={handleEnvVarSelect}
-                                searchTerm={envSearchTerm}
-                                inputValue={value}
-                                cursorPosition={cursorPosition}
-                                workspaceId={workspaceId}
-                                onClose={() => {
-                                  setShowEnvVars(false)
-                                  setActiveInputField(null)
-                                  setActiveHeaderIndex(null)
-                                }}
-                                className='w-[380px]'
-                                maxHeight='200px'
-                                style={{
-                                  position: 'absolute',
-                                  top: '100%',
-                                  left: 0,
-                                  zIndex: 99999,
-                                }}
-                              />
-                            )}
-                        </div>
-                      </div>
-                    ))}
-
-                    <div className='flex items-center justify-between'>
-                      <div />
-                      <div className='w-[380px]'>
-                        <Button
-                          type='button'
-                          variant='outline'
-                          size='sm'
-                          onClick={() => {
-                            setFormData((prev) => ({
-                              ...prev,
-                              headers: { ...prev.headers, '': '' },
-                            }))
-                          }}
-                          className='h-9 text-muted-foreground hover:text-foreground'
-                        >
-                          <Plus className='mr-2 h-3 w-3' />
-                          Add Header
-                        </Button>
-                      </div>
-                    </div>
-
-                    <div className='border-t pt-4'>
-                      <div className='flex items-center justify-between'>
-                        <div className='flex items-center gap-2'>
-                          <Button
-                            variant='ghost'
-                            size='sm'
-                            onClick={handleTestConnection}
-                            disabled={
-                              isTestingConnection || !formData.name.trim() || !formData.url?.trim()
-                            }
-                            className='text-muted-foreground hover:text-foreground'
-                          >
-                            {isTestingConnection ? 'Testing...' : 'Test Connection'}
-                          </Button>
-                          {testResult?.success && (
-                            <span className='text-green-600 text-xs'>✓ Connected</span>
-                          )}
-                        </div>
-                        <div className='flex items-center gap-2'>
-                          {testResult && !testResult.success && (
-                            <span className='ml-4 text-red-600 text-xs'>
-                              {testResult.error || testResult.message}
-                            </span>
-                          )}
-                          <Button variant='ghost' size='sm' onClick={() => setShowAddForm(false)}>
-                            Cancel
-                          </Button>
-                          <Button
-                            size='sm'
-                            onClick={handleAddServer}
-                            disabled={
-                              serversLoading ||
-                              isAddingServer ||
-                              !formData.name.trim() ||
-                              !formData.url?.trim()
-                            }
-                          >
-                            {serversLoading || isAddingServer ? 'Adding...' : 'Add Server'}
-                          </Button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
             </div>
           )}
         </div>
       </div>
 
-      {/* Footer */}
-      <div className='bg-background'>
-        <div className='flex w-full items-center justify-between px-6 py-4'>
-          {serversLoading ? (
-            <>
-              <Skeleton className='h-9 w-[117px] rounded-[8px]' />
-              <div className='w-[200px]' />
-            </>
-          ) : (
-            <>
-              <Button
-                onClick={() => setShowAddForm(!showAddForm)}
-                variant='ghost'
-                className='h-9 rounded-[8px] border bg-background px-3 shadow-xs hover:bg-muted focus:outline-none focus-visible:ring-0 focus-visible:ring-offset-0'
-                disabled={serversLoading}
-              >
-                <Plus className='h-4 w-4 stroke-[2px]' />
-                Add Server
-              </Button>
-              <div className='text-muted-foreground text-xs'>
-                Configure MCP servers to extend workflow capabilities
-              </div>
-            </>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function McpServerSkeleton() {
-  return (
-    <div className='flex flex-col gap-2'>
-      <div className='flex items-center justify-between gap-4'>
-        <div className='flex items-center gap-3'>
-          <Skeleton className='h-8 w-40 rounded-[8px]' /> {/* Server name */}
-          <Skeleton className='h-4 w-16' /> {/* Transport type */}
-          <Skeleton className='h-1 w-1 rounded-full' /> {/* Dot separator */}
-          <Skeleton className='h-4 w-12' /> {/* Tool count */}
-        </div>
-        <Skeleton className='h-8 w-16' /> {/* Delete button */}
-      </div>
-      <div className='mt-1 ml-2 flex flex-wrap gap-1'>
-        <Skeleton className='h-5 w-16 rounded' /> {/* Tool name 1 */}
-        <Skeleton className='h-5 w-20 rounded' /> {/* Tool name 2 */}
-        <Skeleton className='h-5 w-14 rounded' /> {/* Tool name 3 */}
-      </div>
-    </div>
+      <Modal open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+        <ModalContent className='w-[400px]'>
+          <ModalHeader>Delete MCP Server</ModalHeader>
+          <ModalBody>
+            <p className='text-[12px] text-[var(--text-tertiary)]'>
+              Are you sure you want to delete{' '}
+              <span className='font-medium text-[var(--text-primary)]'>{serverToDelete?.name}</span>
+              ? <span className='text-[var(--text-error)]'>This action cannot be undone.</span>
+            </p>
+          </ModalBody>
+          <ModalFooter>
+            <Button variant='default' onClick={() => setShowDeleteDialog(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant='primary'
+              onClick={confirmDeleteServer}
+              className='!bg-[var(--text-error)] !text-white hover:!bg-[var(--text-error)]/90'
+            >
+              Delete
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
+    </>
   )
 }

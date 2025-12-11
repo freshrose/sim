@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid'
 import { createLogger } from '@/lib/logs/console/logger'
+import { TRIGGER_RUNTIME_SUBBLOCK_IDS } from '@/triggers/constants'
 import type { WorkflowState } from '../workflow/types'
 
 const logger = createLogger('WorkflowJsonImporter')
@@ -8,6 +9,7 @@ const logger = createLogger('WorkflowJsonImporter')
  * Generate new IDs for all blocks and edges to avoid conflicts
  */
 function regenerateIds(workflowState: WorkflowState): WorkflowState {
+  const { metadata, variables } = workflowState
   const blockIdMap = new Map<string, string>()
   const newBlocks: WorkflowState['blocks'] = {}
 
@@ -59,10 +61,18 @@ function regenerateIds(workflowState: WorkflowState): WorkflowState {
     })
   }
 
-  // Fifth pass: update any block references in subblock values
+  // Fifth pass: update any block references in subblock values and clear runtime trigger values
   Object.entries(newBlocks).forEach(([blockId, block]) => {
     if (block.subBlocks) {
       Object.entries(block.subBlocks).forEach(([subBlockId, subBlock]) => {
+        if (TRIGGER_RUNTIME_SUBBLOCK_IDS.includes(subBlockId)) {
+          block.subBlocks[subBlockId] = {
+            ...subBlock,
+            value: null,
+          }
+          return
+        }
+
         if (subBlock.value && typeof subBlock.value === 'string') {
           // Replace any block references in the value
           let updatedValue = subBlock.value
@@ -99,7 +109,43 @@ function regenerateIds(workflowState: WorkflowState): WorkflowState {
     edges: newEdges,
     loops: newLoops,
     parallels: newParallels,
+    metadata,
+    variables,
   }
+}
+
+/**
+ * Normalize subblock values by converting empty strings to null.
+ * This provides backwards compatibility for workflows exported before the null sanitization fix,
+ * preventing Zod validation errors like "Expected array, received string".
+ */
+function normalizeSubblockValues(blocks: Record<string, any>): Record<string, any> {
+  const normalizedBlocks: Record<string, any> = {}
+
+  Object.entries(blocks).forEach(([blockId, block]) => {
+    const normalizedBlock = { ...block }
+
+    if (block.subBlocks) {
+      const normalizedSubBlocks: Record<string, any> = {}
+
+      Object.entries(block.subBlocks).forEach(([subBlockId, subBlock]: [string, any]) => {
+        const normalizedSubBlock = { ...subBlock }
+
+        // Convert empty strings to null for consistency
+        if (normalizedSubBlock.value === '') {
+          normalizedSubBlock.value = null
+        }
+
+        normalizedSubBlocks[subBlockId] = normalizedSubBlock
+      })
+
+      normalizedBlock.subBlocks = normalizedSubBlocks
+    }
+
+    normalizedBlocks[blockId] = normalizedBlock
+  })
+
+  return normalizedBlocks
 }
 
 export function parseWorkflowJson(
@@ -200,17 +246,28 @@ export function parseWorkflowJson(
       return { data: null, errors }
     }
 
+    // Normalize non-string subblock values (convert empty strings to null)
+    // This handles exported workflows that may have empty strings for non-string types
+    const normalizedBlocks = normalizeSubblockValues(workflowData.blocks || {})
+
     // Construct the workflow state with defaults
     let workflowState: WorkflowState = {
-      blocks: workflowData.blocks || {},
+      blocks: normalizedBlocks,
       edges: workflowData.edges || [],
       loops: workflowData.loops || {},
       parallels: workflowData.parallels || {},
+      metadata: workflowData.metadata,
+      variables: Array.isArray(workflowData.variables) ? workflowData.variables : undefined,
     }
 
     // Regenerate IDs if requested (default: true)
     if (regenerateIdsFlag) {
-      workflowState = regenerateIds(workflowState)
+      const regeneratedState = regenerateIds(workflowState)
+      workflowState = {
+        ...regeneratedState,
+        metadata: workflowState.metadata,
+        variables: workflowState.variables,
+      }
       logger.info('Regenerated IDs for imported workflow to avoid conflicts')
     }
 

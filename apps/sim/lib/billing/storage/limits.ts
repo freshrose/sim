@@ -9,10 +9,11 @@ import {
   DEFAULT_FREE_STORAGE_LIMIT_GB,
   DEFAULT_PRO_STORAGE_LIMIT_GB,
   DEFAULT_TEAM_STORAGE_LIMIT_GB,
-} from '@sim/db/consts'
+} from '@sim/db/constants'
 import { organization, subscription, userStats } from '@sim/db/schema'
 import { eq } from 'drizzle-orm'
-import { getEnv } from '@/lib/env'
+import { getEnv } from '@/lib/core/config/env'
+import { isBillingEnabled } from '@/lib/core/config/environment'
 import { createLogger } from '@/lib/logs/console/logger'
 
 const logger = createLogger('StorageLimits')
@@ -156,11 +157,20 @@ export async function getUserStorageUsage(userId: string): Promise<number> {
 
 /**
  * Check if user has storage quota available
+ * Always allows uploads when billing is disabled
  */
 export async function checkStorageQuota(
   userId: string,
   additionalBytes: number
 ): Promise<{ allowed: boolean; currentUsage: number; limit: number; error?: string }> {
+  if (!isBillingEnabled) {
+    return {
+      allowed: true,
+      currentUsage: 0,
+      limit: Number.MAX_SAFE_INTEGER,
+    }
+  }
+
   try {
     const [currentUsage, limit] = await Promise.all([
       getUserStorageUsage(userId),

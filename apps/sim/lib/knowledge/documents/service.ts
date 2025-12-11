@@ -3,21 +3,16 @@ import { db } from '@sim/db'
 import { document, embedding, knowledgeBase, knowledgeBaseTagDefinitions } from '@sim/db/schema'
 import { tasks } from '@trigger.dev/sdk'
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm'
-import {
-  checkStorageQuota,
-  decrementStorageUsage,
-  incrementStorageUsage,
-} from '@/lib/billing/storage'
-import { generateEmbeddings } from '@/lib/embeddings/utils'
-import { env } from '@/lib/env'
-import { getSlotsForFieldType, type TAG_SLOT_CONFIG } from '@/lib/knowledge/consts'
+import { env } from '@/lib/core/config/env'
+import { getStorageMethod, isRedisStorage } from '@/lib/core/storage'
+import { getSlotsForFieldType, type TAG_SLOT_CONFIG } from '@/lib/knowledge/constants'
 import { processDocument } from '@/lib/knowledge/documents/document-processor'
+import { DocumentProcessingQueue } from '@/lib/knowledge/documents/queue'
+import type { DocumentSortField, SortOrder } from '@/lib/knowledge/documents/types'
+import { generateEmbeddings } from '@/lib/knowledge/embeddings'
 import { getNextAvailableSlot } from '@/lib/knowledge/tags/service'
 import { createLogger } from '@/lib/logs/console/logger'
-import { getRedisClient } from '@/lib/redis'
 import type { DocumentProcessingPayload } from '@/background/knowledge-processing'
-import { DocumentProcessingQueue } from './queue'
-import type { DocumentSortField, SortOrder } from './types'
 
 const logger = createLogger('DocumentService')
 
@@ -68,8 +63,7 @@ let documentQueue: DocumentProcessingQueue | null = null
 
 export function getDocumentQueue(): DocumentProcessingQueue {
   if (!documentQueue) {
-    const redisClient = getRedisClient()
-    const config = redisClient ? REDIS_PROCESSING_CONFIG : PROCESSING_CONFIG
+    const config = isRedisStorage() ? REDIS_PROCESSING_CONFIG : PROCESSING_CONFIG
     documentQueue = new DocumentProcessingQueue({
       maxConcurrent: config.maxConcurrentDocuments,
       retryDelay: env.KB_CONFIG_MIN_TIMEOUT || 1000,
@@ -80,8 +74,7 @@ export function getDocumentQueue(): DocumentProcessingQueue {
 }
 
 export function getProcessingConfig() {
-  const redisClient = getRedisClient()
-  return redisClient ? REDIS_PROCESSING_CONFIG : PROCESSING_CONFIG
+  return isRedisStorage() ? REDIS_PROCESSING_CONFIG : PROCESSING_CONFIG
 }
 
 export interface DocumentData {
@@ -245,174 +238,43 @@ export async function processDocumentsWithQueue(
     }
   }
 
-  // Priority 2: Redis queue
+  // Priority 2: Queue-based processing (Redis or in-memory based on storage method)
   const queue = getDocumentQueue()
-  const redisClient = getRedisClient()
+  const storageMethod = getStorageMethod()
 
-  if (redisClient) {
-    try {
-      logger.info(`[${requestId}] Using Redis queue for ${createdDocuments.length} documents`)
-
-      const jobPromises = createdDocuments.map((doc) =>
-        queue.addJob<DocumentJobData>('process-document', {
-          knowledgeBaseId,
-          documentId: doc.documentId,
-          docData: {
-            filename: doc.filename,
-            fileUrl: doc.fileUrl,
-            fileSize: doc.fileSize,
-            mimeType: doc.mimeType,
-          },
-          processingOptions,
-          requestId,
-        })
-      )
-
-      await Promise.all(jobPromises)
-
-      // Start Redis background processing
-      queue
-        .processJobs(async (job) => {
-          const data = job.data as DocumentJobData
-          const { knowledgeBaseId, documentId, docData, processingOptions } = data
-          await processDocumentAsync(knowledgeBaseId, documentId, docData, processingOptions)
-        })
-        .catch((error) => {
-          logger.error(`[${requestId}] Error in Redis queue processing:`, error)
-        })
-
-      logger.info(`[${requestId}] All documents queued for Redis processing`)
-      return
-    } catch (error) {
-      logger.warn(`[${requestId}] Redis queue failed, falling back to in-memory processing:`, error)
-    }
-  }
-
-  // Priority 3: In-memory processing
   logger.info(
-    `[${requestId}] Using fallback in-memory processing (neither Trigger.dev nor Redis available)`
+    `[${requestId}] Using ${storageMethod} queue for ${createdDocuments.length} documents`
   )
-  await processDocumentsWithConcurrencyControl(
-    createdDocuments,
-    knowledgeBaseId,
-    processingOptions,
-    requestId
+
+  const jobPromises = createdDocuments.map((doc) =>
+    queue.addJob<DocumentJobData>('process-document', {
+      knowledgeBaseId,
+      documentId: doc.documentId,
+      docData: {
+        filename: doc.filename,
+        fileUrl: doc.fileUrl,
+        fileSize: doc.fileSize,
+        mimeType: doc.mimeType,
+      },
+      processingOptions,
+      requestId,
+    })
   )
-}
 
-/**
- * Original concurrency control processing (fallback when Redis not available)
- */
-async function processDocumentsWithConcurrencyControl(
-  createdDocuments: DocumentData[],
-  knowledgeBaseId: string,
-  processingOptions: ProcessingOptions,
-  requestId: string
-): Promise<void> {
-  const totalDocuments = createdDocuments.length
-  const batches = []
+  await Promise.all(jobPromises)
 
-  for (let i = 0; i < totalDocuments; i += PROCESSING_CONFIG.batchSize) {
-    batches.push(createdDocuments.slice(i, i + PROCESSING_CONFIG.batchSize))
-  }
-
-  logger.info(`[${requestId}] Processing ${totalDocuments} documents in ${batches.length} batches`)
-
-  for (const [batchIndex, batch] of batches.entries()) {
-    logger.info(
-      `[${requestId}] Starting batch ${batchIndex + 1}/${batches.length} with ${batch.length} documents`
-    )
-
-    await processBatchWithConcurrency(batch, knowledgeBaseId, processingOptions, requestId)
-
-    if (batchIndex < batches.length - 1) {
-      const config = getProcessingConfig()
-      if (config.delayBetweenBatches > 0) {
-        await new Promise((resolve) => setTimeout(resolve, config.delayBetweenBatches))
-      }
-    }
-  }
-
-  logger.info(`[${requestId}] Completed processing initiation for all ${totalDocuments} documents`)
-}
-
-/**
- * Process a batch of documents with concurrency control using semaphore
- */
-async function processBatchWithConcurrency(
-  batch: DocumentData[],
-  knowledgeBaseId: string,
-  processingOptions: ProcessingOptions,
-  requestId: string
-): Promise<void> {
-  const config = getProcessingConfig()
-  const semaphore = new Array(config.maxConcurrentDocuments).fill(0)
-  const processingPromises = batch.map(async (doc, index) => {
-    if (index > 0 && config.delayBetweenDocuments > 0) {
-      await new Promise((resolve) => setTimeout(resolve, index * config.delayBetweenDocuments))
-    }
-
-    await new Promise<void>((resolve) => {
-      const checkSlot = () => {
-        const availableIndex = semaphore.findIndex((slot) => slot === 0)
-        if (availableIndex !== -1) {
-          semaphore[availableIndex] = 1
-          resolve()
-        } else {
-          setTimeout(checkSlot, 100)
-        }
-      }
-      checkSlot()
+  queue
+    .processJobs(async (job) => {
+      const data = job.data as DocumentJobData
+      const { knowledgeBaseId, documentId, docData, processingOptions } = data
+      await processDocumentAsync(knowledgeBaseId, documentId, docData, processingOptions)
+    })
+    .catch((error) => {
+      logger.error(`[${requestId}] Error in queue processing:`, error)
     })
 
-    try {
-      logger.info(`[${requestId}] Starting processing for document: ${doc.filename}`)
-
-      await processDocumentAsync(
-        knowledgeBaseId,
-        doc.documentId,
-        {
-          filename: doc.filename,
-          fileUrl: doc.fileUrl,
-          fileSize: doc.fileSize,
-          mimeType: doc.mimeType,
-        },
-        processingOptions
-      )
-
-      logger.info(`[${requestId}] Successfully initiated processing for document: ${doc.filename}`)
-    } catch (error: unknown) {
-      logger.error(`[${requestId}] Failed to process document: ${doc.filename}`, {
-        documentId: doc.documentId,
-        filename: doc.filename,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      })
-
-      try {
-        await db
-          .update(document)
-          .set({
-            processingStatus: 'failed',
-            processingError:
-              error instanceof Error ? error.message : 'Failed to initiate processing',
-            processingCompletedAt: new Date(),
-          })
-          .where(eq(document.id, doc.documentId))
-      } catch (dbError: unknown) {
-        logger.error(
-          `[${requestId}] Failed to update document status for failed document: ${doc.documentId}`,
-          dbError
-        )
-      }
-    } finally {
-      const slotIndex = semaphore.findIndex((slot) => slot === 1)
-      if (slotIndex !== -1) {
-        semaphore[slotIndex] = 0
-      }
-    }
-  })
-
-  await Promise.allSettled(processingPromises)
+  logger.info(`[${requestId}] All documents queued for processing`)
+  return
 }
 
 /**
@@ -439,6 +301,19 @@ export async function processDocumentAsync(
   try {
     logger.info(`[${documentId}] Starting document processing: ${docData.filename}`)
 
+    const kb = await db
+      .select({
+        userId: knowledgeBase.userId,
+        workspaceId: knowledgeBase.workspaceId,
+      })
+      .from(knowledgeBase)
+      .where(eq(knowledgeBase.id, knowledgeBaseId))
+      .limit(1)
+
+    if (kb.length === 0) {
+      throw new Error(`Knowledge base not found: ${knowledgeBaseId}`)
+    }
+
     await db
       .update(document)
       .set({
@@ -458,7 +333,9 @@ export async function processDocumentAsync(
           docData.mimeType,
           processingOptions.chunkSize || 512,
           processingOptions.chunkOverlap || 200,
-          processingOptions.minCharactersPerChunk || 1
+          processingOptions.minCharactersPerChunk || 1,
+          kb[0].userId,
+          kb[0].workspaceId
         )
 
         if (processed.chunks.length > LARGE_DOC_CONFIG.MAX_CHUNKS_PER_DOCUMENT) {
@@ -681,13 +558,6 @@ export async function createDocumentRecords(
     if (kb.length === 0) {
       throw new Error('Knowledge base not found')
     }
-
-    // Always meter the knowledge base owner
-    const quotaCheck = await checkStorageQuota(kb[0].userId, totalSize)
-
-    if (!quotaCheck.allowed) {
-      throw new Error(quotaCheck.error || 'Storage limit exceeded')
-    }
   }
 
   return await db.transaction(async (tx) => {
@@ -758,7 +628,11 @@ export async function createDocumentRecords(
         `[${requestId}] Bulk created ${documentRecords.length} document records in knowledge base ${knowledgeBaseId}`
       )
 
-      // Increment storage usage tracking
+      await tx
+        .update(knowledgeBase)
+        .set({ updatedAt: now })
+        .where(eq(knowledgeBase.id, knowledgeBaseId))
+
       if (userId) {
         const totalSize = documents.reduce((sum, doc) => sum + doc.fileSize, 0)
 
@@ -768,21 +642,6 @@ export async function createDocumentRecords(
           .from(knowledgeBase)
           .where(eq(knowledgeBase.id, knowledgeBaseId))
           .limit(1)
-
-        if (kb.length > 0) {
-          // Always meter the knowledge base owner
-          try {
-            await incrementStorageUsage(kb[0].userId, totalSize)
-            logger.info(
-              `[${requestId}] Updated knowledge base owner storage usage for ${totalSize} bytes`
-            )
-          } catch (error) {
-            logger.error(
-              `[${requestId}] Failed to update knowledge base owner storage usage:`,
-              error
-            )
-          }
-        }
       }
     }
 
@@ -1018,13 +877,6 @@ export async function createSingleDocument(
     if (kb.length === 0) {
       throw new Error('Knowledge base not found')
     }
-
-    // Always meter the knowledge base owner
-    const quotaCheck = await checkStorageQuota(kb[0].userId, documentData.fileSize)
-
-    if (!quotaCheck.allowed) {
-      throw new Error(quotaCheck.error || 'Storage limit exceeded')
-    }
   }
 
   const documentId = randomUUID()
@@ -1070,9 +922,13 @@ export async function createSingleDocument(
 
   await db.insert(document).values(newDocument)
 
+  await db
+    .update(knowledgeBase)
+    .set({ updatedAt: now })
+    .where(eq(knowledgeBase.id, knowledgeBaseId))
+
   logger.info(`[${requestId}] Document created: ${documentId} in knowledge base ${knowledgeBaseId}`)
 
-  // Increment storage usage tracking
   if (userId) {
     // Get knowledge base owner
     const kb = await db
@@ -1080,18 +936,6 @@ export async function createSingleDocument(
       .from(knowledgeBase)
       .where(eq(knowledgeBase.id, knowledgeBaseId))
       .limit(1)
-
-    if (kb.length > 0) {
-      // Always meter the knowledge base owner
-      try {
-        await incrementStorageUsage(kb[0].userId, documentData.fileSize)
-        logger.info(
-          `[${requestId}] Updated knowledge base owner storage usage for ${documentData.fileSize} bytes`
-        )
-      } catch (error) {
-        logger.error(`[${requestId}] Failed to update knowledge base owner storage usage:`, error)
-      }
-    }
   }
 
   return newDocument as {
@@ -1203,28 +1047,6 @@ export async function bulkDocumentOperation(
         )
       )
       .returning({ id: document.id, deletedAt: document.deletedAt })
-
-    // Decrement storage usage tracking
-    if (userId && totalSize > 0) {
-      // Get knowledge base owner
-      const kb = await db
-        .select({ userId: knowledgeBase.userId })
-        .from(knowledgeBase)
-        .where(eq(knowledgeBase.id, knowledgeBaseId))
-        .limit(1)
-
-      if (kb.length > 0) {
-        // Always meter the knowledge base owner
-        try {
-          await decrementStorageUsage(kb[0].userId, totalSize)
-          logger.info(
-            `[${requestId}] Updated knowledge base owner storage usage for -${totalSize} bytes`
-          )
-        } catch (error) {
-          logger.error(`[${requestId}] Failed to update knowledge base owner storage usage:`, error)
-        }
-      }
-    }
   } else {
     // Handle bulk enable/disable
     const enabled = operation === 'enable'

@@ -6,9 +6,9 @@ import { type NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { createApiKey, getApiKeyDisplayFormat } from '@/lib/api-key/auth'
 import { getSession } from '@/lib/auth'
+import { generateRequestId } from '@/lib/core/utils/request'
 import { createLogger } from '@/lib/logs/console/logger'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
-import { generateRequestId } from '@/lib/utils'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('WorkspaceApiKeysAPI')
 
@@ -94,8 +94,25 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const userId = session.user.id
 
     const permission = await getUserEntityPermissions(userId, 'workspace', workspaceId)
-    if (!permission || (permission !== 'admin' && permission !== 'write')) {
+    if (permission !== 'admin') {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    const workspaceRows = await db
+      .select({ billedAccountUserId: workspace.billedAccountUserId })
+      .from(workspace)
+      .where(eq(workspace.id, workspaceId))
+      .limit(1)
+
+    if (!workspaceRows.length) {
+      return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+    }
+
+    if (workspaceRows[0].billedAccountUserId !== userId) {
+      return NextResponse.json(
+        { error: 'Only the workspace billing account can create workspace API keys' },
+        { status: 403 }
+      )
     }
 
     const body = await request.json()
@@ -181,8 +198,25 @@ export async function DELETE(
     const userId = session.user.id
 
     const permission = await getUserEntityPermissions(userId, 'workspace', workspaceId)
-    if (!permission || (permission !== 'admin' && permission !== 'write')) {
+    if (permission !== 'admin') {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    const workspaceRows = await db
+      .select({ billedAccountUserId: workspace.billedAccountUserId })
+      .from(workspace)
+      .where(eq(workspace.id, workspaceId))
+      .limit(1)
+
+    if (!workspaceRows.length) {
+      return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+    }
+
+    if (workspaceRows[0].billedAccountUserId !== userId) {
+      return NextResponse.json(
+        { error: 'Only the workspace billing account can delete workspace API keys' },
+        { status: 403 }
+      )
     }
 
     const body = await request.json()

@@ -1,19 +1,15 @@
-import { useCallback, useEffect, useRef } from 'react'
-import { AlertCircle } from 'lucide-react'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { useRef } from 'react'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useActiveOrganization } from '@/lib/auth-client'
-import { createLogger } from '@/lib/logs/console/logger'
-import { getBaseUrl } from '@/lib/urls/utils'
+import { useActiveOrganization } from '@/lib/auth/auth-client'
+import { getSubscriptionStatus } from '@/lib/billing/client/utils'
+import { getBaseUrl } from '@/lib/core/utils/urls'
 import { UsageHeader } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/settings-modal/components/shared/usage-header'
 import {
   UsageLimit,
   type UsageLimitRef,
 } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/settings-modal/components/subscription/components'
-import { useOrganizationStore } from '@/stores/organization'
-import { useSubscriptionStore } from '@/stores/subscription/store'
-
-const logger = createLogger('TeamUsage')
+import { useOrganizationBilling } from '@/hooks/queries/organization'
+import { useSubscriptionData } from '@/hooks/queries/subscription'
 
 interface TeamUsageProps {
   hasAdminAccess: boolean
@@ -21,36 +17,20 @@ interface TeamUsageProps {
 
 export function TeamUsage({ hasAdminAccess }: TeamUsageProps) {
   const { data: activeOrg } = useActiveOrganization()
-  const { getSubscriptionStatus } = useSubscriptionStore()
+  const { data: subscriptionData } = useSubscriptionData()
+  const subscriptionStatus = getSubscriptionStatus(subscriptionData?.data)
 
   const {
-    organizationBillingData: billingData,
-    loadOrganizationBillingData,
-    isLoadingOrgBilling,
+    data: billingData,
+    isLoading: isLoadingOrgBilling,
     error,
-  } = useOrganizationStore()
-
-  useEffect(() => {
-    if (activeOrg?.id) {
-      loadOrganizationBillingData(activeOrg.id)
-    }
-  }, [activeOrg?.id, loadOrganizationBillingData])
-
-  const handleLimitUpdated = useCallback(
-    async (newLimit: number) => {
-      // Reload the organization billing data to reflect the new limit
-      if (activeOrg?.id) {
-        await loadOrganizationBillingData(activeOrg.id, true)
-      }
-    },
-    [activeOrg?.id, loadOrganizationBillingData]
-  )
+  } = useOrganizationBilling(activeOrg?.id || '')
 
   const usageLimitRef = useRef<UsageLimitRef | null>(null)
 
   if (isLoadingOrgBilling) {
     return (
-      <div className='rounded-[8px] border bg-background p-3 shadow-xs'>
+      <div className='rounded-[8px] border bg-[var(--surface-3)] p-3 shadow-xs'>
         <div className='space-y-2'>
           <div className='flex items-center justify-between'>
             <div className='flex items-center gap-2'>
@@ -59,7 +39,7 @@ export function TeamUsage({ hasAdminAccess }: TeamUsageProps) {
             </div>
             <div className='flex items-center gap-1 text-xs'>
               <Skeleton className='h-4 w-8' />
-              <span className='text-muted-foreground'>/</span>
+              <span className='text-[var(--text-muted)]'>/</span>
               <Skeleton className='h-4 w-8' />
             </div>
           </div>
@@ -71,11 +51,11 @@ export function TeamUsage({ hasAdminAccess }: TeamUsageProps) {
 
   if (error) {
     return (
-      <Alert variant='destructive'>
-        <AlertCircle className='h-4 w-4' />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>{error}</AlertDescription>
-      </Alert>
+      <div className='rounded-[8px] border bg-[var(--surface-3)] p-3 shadow-xs'>
+        <p className='text-center text-[#DC2626] text-[11px] leading-tight dark:text-[#F87171]'>
+          {error instanceof Error ? error.message : 'Failed to load billing data'}
+        </p>
+      </div>
     )
   }
 
@@ -83,16 +63,16 @@ export function TeamUsage({ hasAdminAccess }: TeamUsageProps) {
     return null
   }
 
-  const currentUsage = billingData.totalCurrentUsage || 0
-  const currentCap = billingData.totalUsageLimit || billingData.minimumBillingAmount || 0
-  const minimumBilling = billingData.minimumBillingAmount || 0
-  const seatsCount = billingData.seatsCount || 1
+  const currentUsage = billingData.totalCurrentUsage ?? 0
+  const currentCap = billingData.totalUsageLimit ?? billingData.minimumBillingAmount ?? 0
+  const minimumBilling = billingData.minimumBillingAmount ?? 0
+  const seatsCount = billingData.seatsCount ?? 0
   const percentUsed =
     currentCap > 0 ? Math.round(Math.min((currentUsage / currentCap) * 100, 100)) : 0
   const status: 'ok' | 'warning' | 'exceeded' =
     percentUsed >= 100 ? 'exceeded' : percentUsed >= 80 ? 'warning' : 'ok'
 
-  const subscription = getSubscriptionStatus()
+  const subscription = subscriptionStatus
   const title = subscription.isEnterprise
     ? 'Enterprise'
     : subscription.isTeam
@@ -144,10 +124,9 @@ export function TeamUsage({ hasAdminAccess }: TeamUsageProps) {
             minimumLimit={minimumBilling}
             context='organization'
             organizationId={activeOrg.id}
-            onLimitUpdated={handleLimitUpdated}
           />
         ) : (
-          <span className='text-muted-foreground text-xs tabular-nums'>
+          <span className='font-medium text-[12px] text-[var(--text-secondary)] tabular-nums'>
             ${currentCap.toFixed(0)}
           </span>
         )
